@@ -58,8 +58,8 @@ RESET_PROGRAM = "reset"
 ENABLE_CARTRIDGE_CHECK = False
 DEFAULT_RECIPE = "PCB_466"
 XARM_IP = "192.168.1.196"  
-RESET_ENABLE_WAIT_SECONDS = 15
-RESET_HOME_TIMEOUT_SECONDS = 20
+RESET_ENABLE_WAIT_SECONDS = 5
+RESET_HOME_TIMEOUT_SECONDS = 7
 
 
 @dataclass
@@ -104,6 +104,8 @@ class RobotController:
         self.state = SensorState()
         self.current_recipe: Optional[str] = None
         self.current_recipe_module = None
+        self.program_cycle_counts = {}
+        self.program_last_cycle_seconds = {}
         self.arm = None
         self.recipe_thread = None
         self.reset_thread = None
@@ -301,6 +303,18 @@ class RobotController:
         spec.loader.exec_module(module)
         self.current_recipe = recipe_name
         self.current_recipe_module = module
+        self.program_cycle_counts.setdefault(recipe_name, 0)
+        self.program_last_cycle_seconds.setdefault(recipe_name, 0.0)
+
+    def get_program_cycle_count(self, recipe_name: Optional[str]) -> int:
+        if not recipe_name:
+            return 0
+        return self.program_cycle_counts.get(recipe_name, 0)
+
+    def get_program_last_cycle_seconds(self, recipe_name: Optional[str]) -> float:
+        if not recipe_name:
+            return 0.0
+        return self.program_last_cycle_seconds.get(recipe_name, 0.0)
 
     def _run_loaded_recipe(self) -> None:
         self._execute_loaded_program(count_cycle=True)
@@ -311,6 +325,7 @@ class RobotController:
         start_time = time.perf_counter()
         try:
             module = self.current_recipe_module
+            recipe_name = self.current_recipe
             if module is None:
                 raise RuntimeError("No recipe module loaded.")
             if hasattr(module, 'RobotMain'):
@@ -321,10 +336,13 @@ class RobotController:
                 module.run(self)
             else:
                 raise RuntimeError("Recipe file has neither RobotMain nor run().")
-            if count_cycle and not self.cycle_abort_requested:
+            if not self.cycle_abort_requested and recipe_name:
                 elapsed = time.perf_counter() - start_time
                 self.state.last_cycle_seconds = elapsed
-                self.state.cycle_count += 1
+                self.program_last_cycle_seconds[recipe_name] = elapsed
+                self.program_cycle_counts[recipe_name] = self.program_cycle_counts.get(recipe_name, 0) + 1
+                if count_cycle:
+                    self.state.cycle_count += 1
         except Exception as exc:
             print(f"Recipe run failed: {exc}")
         finally:
@@ -606,7 +624,7 @@ class MainWindow(QMainWindow):
 
         metrics_wrap = QHBoxLayout()
         metrics_wrap.setSpacing(12)
-        self.cycle_count_card = MetricCard("Cycle Count", "0", "blue")
+        self.cycle_count_card = MetricCard("Program Count", "0", "blue")
         self.last_cycle_card = MetricCard("Last Cycle Time", "--:--", "purple")
         metrics_wrap.addWidget(self.cycle_count_card)
         metrics_wrap.addWidget(self.last_cycle_card)
@@ -641,35 +659,37 @@ class MainWindow(QMainWindow):
         recipe_help.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(recipe_help)
 
-        self.recipe_combo = QComboBox()
-        self.recipe_combo.setObjectName("RecipeCombo")
-        left_layout.addWidget(self.recipe_combo)
-
         info_bar = QFrame()
         info_bar.setObjectName("InfoBar")
         info_bar_layout = QVBoxLayout(info_bar)
-        info_bar_layout.setContentsMargins(18, 14, 18, 14)
-        info_bar_layout.setSpacing(5)
+        info_bar_layout.setContentsMargins(18, 16, 18, 16)
+        info_bar_layout.setSpacing(6)
 
-        self.loaded_program_label = QLabel("Loaded Program: None")
-        self.loaded_program_label.setObjectName("InfoLabelStrong")
+        self.loaded_program_label = QLabel(DEFAULT_RECIPE)
+        self.loaded_program_label.setObjectName("LoadedProgramTile")
         self.loaded_program_label.setAlignment(Qt.AlignCenter)
         info_bar_layout.addWidget(self.loaded_program_label)
 
-        hint_label = QLabel("")
+        hint_label = QLabel("Currently loaded program")
         hint_label.setObjectName("InfoLabel")
         hint_label.setAlignment(Qt.AlignCenter)
         info_bar_layout.addWidget(hint_label)
 
         left_layout.addWidget(info_bar)
 
+        self.recipe_combo = QComboBox()
+        self.recipe_combo.setObjectName("RecipeCombo")
+        self.recipe_combo.currentIndexChanged.connect(self.on_recipe_selected)
+        left_layout.addWidget(self.recipe_combo)
+
+        left_layout.addStretch()
+
         self.refresh_button = QPushButton("Refresh Programs")
         self.refresh_button.setObjectName("SecondaryButton")
         self.refresh_button.clicked.connect(self.refresh_recipes)
         left_layout.addWidget(self.refresh_button)
-        left_layout.addStretch()
 
-        self.content_layout.addWidget(left_panel, 0, 0)
+        self.content_layout.addWidget(left_panel, 0, 1)
 
         middle_panel = GlowPanel()
         middle_layout = QVBoxLayout(middle_panel)
@@ -711,7 +731,7 @@ class MainWindow(QMainWindow):
         middle_layout.addLayout(self.status_cards)
         middle_layout.addStretch()
 
-        self.content_layout.addWidget(middle_panel, 0, 1)
+        self.content_layout.addWidget(middle_panel, 0, 0)
 
         right_panel = GlowPanel()
         right_layout = QVBoxLayout(right_panel)
@@ -767,7 +787,7 @@ class MainWindow(QMainWindow):
         initial_recipe_index = self.recipe_combo.findText(DEFAULT_RECIPE)
         if initial_recipe_index >= 0:
             self.recipe_combo.setCurrentIndex(initial_recipe_index)
-            self.loaded_program_label.setText(f"Loaded Program: {DEFAULT_RECIPE}")
+            self.update_loaded_program_display()
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.update_status)
@@ -894,6 +914,15 @@ class MainWindow(QMainWindow):
                 font-size: 14px;
                 font-weight: 700;
                 color: #dbeafe;
+            }
+            QLabel#LoadedProgramTile {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #082f49, stop:1 #0f4c81);
+                border: 1px solid #38bdf8;
+                border-radius: 18px;
+                padding: 18px 14px;
+                font-size: 24px;
+                font-weight: 800;
+                color: #f8fbff;
             }
             QLabel#InfoLabel {
                 font-size: 12px;
@@ -1027,6 +1056,33 @@ class MainWindow(QMainWindow):
         if self.recipe_combo.count() == 0:
             self.recipe_combo.addItem(DEFAULT_RECIPE, str(self.recipe_dir / f"{DEFAULT_RECIPE}.py"))
 
+    def update_loaded_program_display(self):
+        loaded_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
+        self.loaded_program_label.setText(loaded_name)
+
+    def on_recipe_selected(self, _index: int):
+        recipe_path_raw = self.recipe_combo.currentData()
+        if not recipe_path_raw:
+            self.update_loaded_program_display()
+            self.update_status()
+            return
+
+        if self.robot._cycle_active() or self.robot._reset_active() or self.robot.state.robot_resetting:
+            self.update_loaded_program_display()
+            self.update_status()
+            return
+
+        recipe_path = Path(recipe_path_raw)
+        recipe_name = recipe_path.stem
+
+        try:
+            self.robot.load_recipe(recipe_name, recipe_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Failed", str(exc))
+
+        self.update_loaded_program_display()
+        self.update_status()
+
     def set_live_commentary(self, text: str):
         self.live_commentary.setText(text)
 
@@ -1052,6 +1108,8 @@ class MainWindow(QMainWindow):
         motion_stopped = bool(stop_moving or state_code in {3, 4} or (not robot_moving and robot_enabled))
         dispenser_on = self.robot.is_dispenser_on()
         loaded_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
+        loaded_program_count = self.robot.get_program_cycle_count(loaded_name)
+        loaded_program_last_cycle = self.robot.get_program_last_cycle_seconds(loaded_name)
 
         self.program_card.set_status(loaded_name, True)
         self.board_card.set_status("DETECTED" if board_present else "NOT DETECTED", board_present )
@@ -1107,8 +1165,8 @@ class MainWindow(QMainWindow):
             else:
                 self.set_live_commentary(f"Ready to run program {loaded_name}")
 
-        self.cycle_count_card.set_value(str(self.robot.state.cycle_count))
-        self.last_cycle_card.set_value(self.format_cycle_time(self.robot.state.last_cycle_seconds))
+        self.cycle_count_card.set_value(str(loaded_program_count))
+        self.last_cycle_card.set_value(self.format_cycle_time(loaded_program_last_cycle))
 
         if physical_start and not self.start_latch and not self.robot.state.robot_running and not self.robot.state.robot_resetting:
             self.start_latch = True
@@ -1136,7 +1194,7 @@ class MainWindow(QMainWindow):
 
         try:
             self.robot.load_recipe(recipe_name, recipe_path)
-            self.loaded_program_label.setText(f"Loaded Program: {recipe_name}")
+            self.update_loaded_program_display()
             self.robot.start_cycle()
         except Exception as exc:
             QMessageBox.critical(self, "Start Failed", str(exc))
@@ -1144,7 +1202,7 @@ class MainWindow(QMainWindow):
     def run_manual_dispense(self):
         try:
             self.robot.run_manual_dispense()
-            self.loaded_program_label.setText(f"Loaded Program: {MANUAL_DISPENSE_PROGRAM}")
+            self.update_loaded_program_display()
             self.set_live_commentary("Running epoxy purge")
         except Exception as exc:
             QMessageBox.critical(self, "Purge Failed", str(exc))
