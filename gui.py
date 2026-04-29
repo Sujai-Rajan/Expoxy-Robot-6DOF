@@ -38,21 +38,38 @@ if SDK_DIR.exists():
 # DI0-DI7 => 8-15
 # CO0-CO7 => 0-7
 # DO0-DO7 => 8-15
+#
+# Inputs:
+#   CI0 => E-Stop (handled by xArm controller via WebUI input config; not read in code)
+#   CI1 => Manual Mode (handled by xArm controller; we read state via CO1 / mode_code)
+#   CI2 => wired but unused (reserved)
+#   CI3 => not wired
+#   CI4 => Start / Resume button
+#   CI5 => Pause button
+#   CI6 => Stop button
+#   CI7 => not wired (reserved)
+#   DI0 => Board present sensor
+#   DI1 => Cartridge empty sensor (currently disabled via ENABLE_CARTRIDGE_CHECK)
+#   DI4 => Light curtain (1 = beam broken, 0 = clear)
+# Outputs:
+#   CO0..CO6 are configured at the xArm WebUI to mirror controller status
+#   CO7 => Dispenser trigger (driven by recipes)
+PHYSICAL_START_CI = 4         # CI4 => Start / Resume button (active high)
+PAUSE_BUTTON_CI = 5           # CI5 => Pause button (active high)
+STOP_BUTTON_CI = 6            # CI6 => Stop button (active high)
+MANUAL_MODE_CI = 1            # CI1 => Manual mode (firmware-handled, kept for reference)
 BOARD_PRESENT_DI = 0          # DI0 => CGPIO channel 8
-CARTRIDGE_EMPTY_DI = 1        # DI1 => CGPIO channel 9
-ENABLE_ROBOT_CI = 0           # CI0 => Enable Robot
-MANUAL_MODE_CI = 1            # CI1 => Manual Mode
-SAFEGUARD_RESET_CI = 2        # CI2 => Safeguard Reset
-STOP_MOVING_CI = 3            # CI3 => Stop Moving
-PHYSICAL_START_CI = 4         # CI4 => dedicated cycle start input
-ROBOT_ENABLED_CO = 0          # CO0 => Robot Enabled
-MANUAL_MODE_CO = 1            # CO1 => Manual Mode
+CARTRIDGE_EMPTY_DI = 1        # DI1 => CGPIO channel 9 (disabled below)
+LIGHT_CURTAIN_DI = 4          # DI4 => CGPIO channel 12, value 1 means beam broken
+LIGHT_CURTAIN_BROKEN_VALUE = 1
+ROBOT_ENABLED_CO = 0          # CO0 => Robot Enabled (status from controller)
+MANUAL_MODE_CO = 1            # CO1 => Manual Mode (status from controller)
 MOTION_STOPPED_CO = 2         # CO2 => Motion Stopped
 EMERGENCY_STOP_CO = 3         # CO3 => Emergency Stop Pressed
 WARNING_CO = 4                # CO4 => Warning
 ERROR_CO = 5                  # CO5 => Error
 ROBOT_MOVING_CO = 6           # CO6 => Robot Moving
-DISPENSER_TRIGGER_CO = 7      # CO7 => CGPIO channel 7
+DISPENSER_TRIGGER_CO = 7      # CO7 => Dispenser trigger
 MANUAL_DISPENSE_PROGRAM = "purge"
 RESET_PROGRAM = "reset"
 ENABLE_CARTRIDGE_CHECK = False
@@ -66,10 +83,9 @@ RESET_HOME_TIMEOUT_SECONDS = 7
 class SensorState:
     board_present: bool = False
     cartridge_empty: bool = False
-    enable_robot: bool = False
     manual_mode: bool = False
-    safeguard_reset: bool = False
-    stop_moving: bool = False
+    light_curtain_broken: bool = False
+    light_curtain_paused: bool = False
     dispenser_on: bool = False
     robot_running: bool = False
     robot_paused: bool = False
@@ -193,29 +209,21 @@ class RobotController:
     def read_physical_start(self) -> bool:
         return self.read_ci(PHYSICAL_START_CI)
 
-    @staticmethod
-    def _controller_function_active(raw_state: bool) -> bool:
-        return not raw_state
+    def read_pause_button(self) -> bool:
+        return self.read_ci(PAUSE_BUTTON_CI)
 
-    def read_enable_robot(self) -> bool:
-        enabled = self._controller_function_active(self.read_ci(ENABLE_ROBOT_CI))
-        self.state.enable_robot = enabled
-        return enabled
+    def read_stop_button(self) -> bool:
+        return self.read_ci(STOP_BUTTON_CI)
+
+    def read_light_curtain(self) -> bool:
+        broken = self.read_di(LIGHT_CURTAIN_DI) == bool(LIGHT_CURTAIN_BROKEN_VALUE)
+        self.state.light_curtain_broken = broken
+        return broken
 
     def read_manual_mode(self) -> bool:
-        manual_mode = self._controller_function_active(self.read_ci(MANUAL_MODE_CI))
+        manual_mode = self.read_robot_mode_code() == 2
         self.state.manual_mode = manual_mode
         return manual_mode
-
-    def read_safeguard_reset(self) -> bool:
-        safeguard_reset = self._controller_function_active(self.read_ci(SAFEGUARD_RESET_CI))
-        self.state.safeguard_reset = safeguard_reset
-        return safeguard_reset
-
-    def read_stop_moving(self) -> bool:
-        stop_moving = self._controller_function_active(self.read_ci(STOP_MOVING_CI))
-        self.state.stop_moving = stop_moving
-        return stop_moving
 
     @staticmethod
     def _extract_sdk_scalar(result) -> Optional[int]:
@@ -585,7 +593,12 @@ class MainWindow(QMainWindow):
         self.recipe_dir = RECIPES_DIR
         self.recipe_dir.mkdir(exist_ok=True)
         # Ignore any held physical inputs on startup until they are released once.
+        # All hardware buttons fire on rising edge (False -> True transition).
         self.start_latch = self.robot.read_physical_start()
+        self.pause_latch = self.robot.read_pause_button()
+        self.stop_latch = self.robot.read_stop_button()
+        self.curtain_latch = self.robot.read_light_curtain()
+        self.curtain_warning_active = False
         self.status_cards_compact: Optional[bool] = None
 
         self.setWindowTitle("Dispensing Cell HMI")
@@ -706,12 +719,12 @@ class MainWindow(QMainWindow):
         self.status_cards.setVerticalSpacing(14)
 
         self.program_card = StatusCard("Loaded Program", "Current recipe")
-        self.board_card = StatusCard("Board Presence", "DI0 / channel 8")
+        self.board_card = StatusCard("Board Presence", "DI0 board sensor")
         self.dispenser_card = StatusCard("Dispenser", "CO7 epoxy trigger")
-        self.motion_card = StatusCard("Robot Motion", "CO6 moving / CO2 stopped")
+        self.motion_card = StatusCard("Robot Motion", "Controller status")
         self.run_card = StatusCard("Robot State", "Controller state / mode")
-        self.enable_card = StatusCard("Robot Enabled", "CI0 low / CO0")
-        self.manual_card = StatusCard("Manual Mode", "CI1 low / CO1")
+        self.light_curtain_card = StatusCard("Light Curtain", "DI4 safety beam")
+        self.manual_card = StatusCard("Manual Mode", "Controller mode")
         self.warning_card = StatusCard("Warning", "CO4 / warn_code")
         self.error_card = StatusCard("Error", "CO5 / error_code")
         self.status_card_widgets = (
@@ -720,7 +733,7 @@ class MainWindow(QMainWindow):
             self.dispenser_card,
             self.motion_card,
             self.run_card,
-            self.enable_card,
+            self.light_curtain_card,
             self.manual_card,
             self.warning_card,
             self.error_card,
@@ -1089,10 +1102,11 @@ class MainWindow(QMainWindow):
     def update_status(self):
         board_present = self.robot.read_board_present()
         _cartridge_empty = self.robot.read_cartridge_empty()
-        enable_robot = self.robot.read_enable_robot()
         manual_mode = self.robot.read_manual_mode()
-        stop_moving = self.robot.read_stop_moving()
+        light_curtain_broken = self.robot.read_light_curtain()
         physical_start = self.robot.read_physical_start()
+        pause_button = self.robot.read_pause_button()
+        stop_button = self.robot.read_stop_button()
         state_code = self.robot.read_robot_state_code()
         mode_code = self.robot.read_robot_mode_code()
         warning_code = self.robot.read_warning_code()
@@ -1101,83 +1115,149 @@ class MainWindow(QMainWindow):
         emergency_stop_active = error_code in {1, 2, 3}
         manual_mode_active = manual_mode or mode_code == 2
         if self.robot.arm is None:
-            robot_enabled = enable_robot
+            robot_enabled = False
         else:
             robot_enabled = error_code == 0 and state_code is not None and state_code < 4
         robot_moving = bool(self.robot.state.robot_running or state_code == 1)
-        motion_stopped = bool(stop_moving or state_code in {3, 4} or (not robot_moving and robot_enabled))
+        motion_stopped = bool(state_code in {3, 4} or (not robot_moving and robot_enabled))
         dispenser_on = self.robot.is_dispenser_on()
         loaded_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
         loaded_program_count = self.robot.get_program_cycle_count(loaded_name)
         loaded_program_last_cycle = self.robot.get_program_last_cycle_seconds(loaded_name)
 
+        # ---- Hardware button edge handling (rising edge: False -> True) ----
+        # Light curtain: auto-pause running cycle when beam breaks.
+        if light_curtain_broken and not self.curtain_latch:
+            if self.robot.state.robot_running and not self.robot.state.robot_paused:
+                try:
+                    self.robot.pause_immediate()
+                    self.robot.state.light_curtain_paused = True
+                except Exception as exc:
+                    print(f"Light curtain auto-pause failed: {exc}")
+        if not light_curtain_broken:
+            # Beam restored — operator may now resume by pressing Start.
+            pass
+        self.curtain_latch = light_curtain_broken
+
+        # CI5 pause button.
+        if pause_button and not self.pause_latch:
+            if self.robot.state.robot_running and not self.robot.state.robot_paused:
+                self.pause_cycle()
+        self.pause_latch = pause_button
+
+        # CI6 stop button.
+        if stop_button and not self.stop_latch:
+            if self.robot.state.robot_running or self.robot.state.robot_paused:
+                self.stop_cycle()
+        self.stop_latch = stop_button
+
+        # CI4 start / resume button — gated by light curtain.
+        if physical_start and not self.start_latch:
+            self.start_latch = True
+            if light_curtain_broken:
+                QMessageBox.warning(
+                    self,
+                    "Cannot Start",
+                    "Light curtain is broken. Clear the area before starting.",
+                )
+            elif not self.robot.state.robot_running and not self.robot.state.robot_resetting:
+                self.start_cycle()
+        elif not physical_start:
+            self.start_latch = False
+
+        # ---- Status card updates ----
         self.program_card.set_status(loaded_name, True)
-        self.board_card.set_status("DETECTED" if board_present else "NOT DETECTED", board_present )
-        self.enable_card.set_status("ENABLED" if robot_enabled else "DISABLED", robot_enabled)
-        self.manual_card.set_status("ENABLED" if manual_mode_active else "DISABLED", manual_mode_active, f"Mode code {mode_code if mode_code is not None else '--'}")
-        self.warning_card.set_status("ACTIVE" if warning_code else "CLEAR", warning_code == 0, f"warn_code={warning_code}")
-        self.error_card.set_status("ACTIVE" if error_code else "CLEAR", error_code == 0, f"error_code={error_code}")
-        self.motion_card.set_status("STOPPED" if motion_stopped else "MOVING", not motion_stopped )
+        self.board_card.set_status("DETECTED" if board_present else "NOT DETECTED", board_present)
+        self.light_curtain_card.set_status(
+            "BROKEN" if light_curtain_broken else "CLEAR",
+            not light_curtain_broken,
+            "Robot will pause when broken",
+        )
+        self.manual_card.set_status(
+            "ENABLED" if manual_mode_active else "DISABLED",
+            not manual_mode_active,
+            f"Mode code {mode_code if mode_code is not None else '--'}",
+        )
+        self.warning_card.set_status(
+            "ACTIVE" if warning_code else "CLEAR",
+            warning_code == 0,
+            f"warn_code={warning_code}",
+        )
+        self.error_card.set_status(
+            "ACTIVE" if error_code else "CLEAR",
+            error_code == 0,
+            f"error_code={error_code}",
+        )
+        self.motion_card.set_status("STOPPED" if motion_stopped else "MOVING", not motion_stopped)
         self.dispenser_card.set_status("ON" if dispenser_on else "OFF", dispenser_on)
 
+        # ---- Hero / run state ----
+        state_subtitle = (
+            f"State {state_code if state_code is not None else '--'} / "
+            f"Mode {mode_code if mode_code is not None else '--'}"
+        )
         if emergency_stop_active:
-            self.run_card.set_status("E-STOP", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("E-STOP", False, state_subtitle)
             self.hero_state.setText("ESTOP ACTIVE")
-            self.set_live_commentary("Emergency stop is active on the controller")
+            self.set_live_commentary("Emergency stop is active. Release the E-stop on the cabinet, then press Reset.")
         elif self.robot.last_reset_error or error_code:
-            self.run_card.set_status("FAULT", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("FAULT", False, state_subtitle)
             self.hero_state.setText("SYSTEM FAULT")
-            self.set_live_commentary(self.robot.last_reset_error or f"Robot error code {error_code}")
+            self.set_live_commentary(self.robot.last_reset_error or f"Robot error code {error_code}. Press Reset to recover.")
         elif manual_mode_active:
-            self.run_card.set_status("MANUAL", True, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("MANUAL", True, state_subtitle)
             self.hero_state.setText("MANUAL MODE")
-            self.set_live_commentary("Manual mode active: the arm can be guided by hand")
+            self.set_live_commentary("Manual mode active: the arm can be guided by hand. Switch to auto to run programs.")
         elif self.robot.state.robot_resetting:
-            self.run_card.set_status("RESETTING", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("RESETTING", False, state_subtitle)
             self.hero_state.setText("SYSTEM RESETTING")
-            if enable_robot:
-                self.set_live_commentary("Moving to home")
-            else:
-                self.set_live_commentary("Waiting for Button Press")
-        elif stop_moving:
-            self.run_card.set_status("HOLD", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
-            self.hero_state.setText("MOTION HOLD")
-            self.set_live_commentary("Stop Moving input is active on CI3")
+            self.set_live_commentary("Moving to home position")
         elif self.robot.state.robot_running:
-            self.run_card.set_status("RUNNING", True, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("RUNNING", True, state_subtitle)
             self.hero_state.setText("SYSTEM RUNNING")
             self.set_live_commentary(f"Running program {loaded_name}")
         elif self.robot.state.robot_paused:
-            self.run_card.set_status("PAUSED", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("PAUSED", False, state_subtitle)
             self.hero_state.setText("SYSTEM PAUSED")
-            self.set_live_commentary("Paused by operator")
+            if self.robot.state.light_curtain_paused:
+                if light_curtain_broken:
+                    self.set_live_commentary("Paused: light curtain is broken. Clear the area, then press Start to resume.")
+                else:
+                    self.set_live_commentary("Paused by light curtain. Press Start to resume.")
+            else:
+                self.set_live_commentary("Paused by operator. Press Start to resume.")
         elif self.robot.state.robot_stopped:
-            self.run_card.set_status("STOPPED", False, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("STOPPED", False, state_subtitle)
             self.hero_state.setText("SYSTEM STOPPED")
-            self.set_live_commentary("Stopped by operator")
+            self.set_live_commentary("Stopped by operator. Press Start to run the program from the beginning.")
         else:
-            self.run_card.set_status("IDLE", robot_enabled, f"State {state_code if state_code is not None else '--'} / Mode {mode_code if mode_code is not None else '--'}")
+            self.run_card.set_status("IDLE", robot_enabled, state_subtitle)
             self.hero_state.setText("SYSTEM IDLE")
-            if warning_code:
+            if light_curtain_broken:
+                self.set_live_commentary("Light curtain is broken. Clear the area before starting.")
+            elif warning_code:
                 self.set_live_commentary(f"Robot warning code {warning_code}")
             elif not board_present:
-                self.set_live_commentary("Waiting for board")
+                self.set_live_commentary("Place a board in the fixture, then press Start.")
             else:
-                self.set_live_commentary(f"Ready to run program {loaded_name}")
+                self.set_live_commentary(f"Ready to run program {loaded_name}. Press Start.")
 
         self.cycle_count_card.set_value(str(loaded_program_count))
         self.last_cycle_card.set_value(self.format_cycle_time(loaded_program_last_cycle))
 
-        if physical_start and not self.start_latch and not self.robot.state.robot_running and not self.robot.state.robot_resetting:
-            self.start_latch = True
-            self.start_cycle()
-        elif not physical_start:
-            self.start_latch = False
-
     def start_cycle(self):
+        if self.robot.state.light_curtain_broken:
+            QMessageBox.warning(
+                self,
+                "Cannot Start",
+                "Light curtain is broken. Clear the area before starting.",
+            )
+            return
+
         if self.robot.state.robot_paused and self.robot._cycle_active():
             try:
                 self.robot.start_cycle()
+                self.robot.state.light_curtain_paused = False
                 active_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
                 self.set_live_commentary(f"Resumed program {active_name}")
             except Exception as exc:
@@ -1196,6 +1276,7 @@ class MainWindow(QMainWindow):
             self.robot.load_recipe(recipe_name, recipe_path)
             self.update_loaded_program_display()
             self.robot.start_cycle()
+            self.robot.state.light_curtain_paused = False
         except Exception as exc:
             QMessageBox.critical(self, "Start Failed", str(exc))
 
