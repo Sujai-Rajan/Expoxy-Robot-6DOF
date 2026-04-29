@@ -61,7 +61,7 @@ MANUAL_MODE_CI = 1            # CI1 => Manual mode (firmware-handled, kept for r
 BOARD_PRESENT_DI = 0          # DI0 => CGPIO channel 8
 CARTRIDGE_EMPTY_DI = 1        # DI1 => CGPIO channel 9 (disabled below)
 LIGHT_CURTAIN_DI = 4          # DI4 => CGPIO channel 12, value 1 means beam broken
-LIGHT_CURTAIN_BROKEN_VALUE = 1
+LIGHT_CURTAIN_BROKEN_VALUE = 0
 ROBOT_ENABLED_CO = 0          # CO0 => Robot Enabled (status from controller)
 MANUAL_MODE_CO = 1            # CO1 => Manual Mode (status from controller)
 MOTION_STOPPED_CO = 2         # CO2 => Motion Stopped
