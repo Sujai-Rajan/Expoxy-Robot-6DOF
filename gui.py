@@ -1,3 +1,34 @@
+"""
+Dispensing Cell HMI — uFactory xArm 850 / DP160 Epoxy Applicator
+=================================================================
+SDK optimisations applied
+  • Single get_cgpio_state() call per poll tick (replaces 7 individual reads).
+  • SDK push-report callbacks (state / mode / error+warn / connect) update a
+    thread-safe snapshot; read_* methods read the snapshot instead of making
+    blocking RPC calls.
+  • arm.state / arm.mode attributes (kept fresh by SDK background thread) used
+    as fallback when callback data is not yet populated.
+  • clean_error() + clean_warn() + motion_enable() called before every reset so
+    the controller can recover from fault states cleanly.
+  • Graceful disconnect on application close.
+
+Wiring
+------
+CI0  E-Stop          → handled by xArm firmware (WebUI input config)
+CI1  Manual Mode     → handled by xArm firmware; reflected via mode_code
+CI2  Tube Change     → run tube_change recipe (operator presses to swap epoxy)
+CI3  (not wired)
+CI4  Start / Resume  → active high
+CI5  Pause           → active high
+CI6  Stop            → active high
+CI7  Reset to Home   → active high
+DI0  Board Present   → photoelectric sensor
+DI1  Cartridge Empty → (disabled, ENABLE_CARTRIDGE_CHECK = False)
+DI4  Light Curtain   → LIGHT_CURTAIN_BROKEN_VALUE = 0 (NC sensor, 0 = broken)
+CO7  Dispenser Trigger
+CO0-CO6 firmware-driven status outputs (configured in xArm WebUI)
+"""
+
 import sys
 import time
 import importlib.util
@@ -25,80 +56,88 @@ from PySide6.QtWidgets import (
 
 BASE_DIR = Path(__file__).resolve().parent
 RECIPES_DIR = BASE_DIR / "recipes"
-SDK_DIR = BASE_DIR / "Dependencies" / "xArm-Python-SDK-master"
 
-if SDK_DIR.exists():
-    sdk_path = str(SDK_DIR)
-    if sdk_path not in sys.path:
-        sys.path.insert(0, sdk_path)
+# Locate the xArm Python SDK — check both possible install paths.
+for _sdk_candidate in (
+    BASE_DIR / "xArm-Python-SDK",
+    BASE_DIR / "Dependencies" / "xArm-Python-SDK-master",
+):
+    if _sdk_candidate.exists():
+        _sdk_str = str(_sdk_candidate)
+        if _sdk_str not in sys.path:
+            sys.path.insert(0, _sdk_str)
+        break
 
+# ---------------------------------------------------------------------------
+# xArm CGPIO channel mapping
+# CI0-CI7  => channels  0-7   (digital inputs, controller side)
+# DI0-DI7  => channels  8-15  (digital inputs, tool / expansion side)
+# CO0-CO7  => channels  0-7   (digital outputs, controller side)
+# get_cgpio_state() states[2] bitmask: bit i = channel i state (0-15)
+# ---------------------------------------------------------------------------
 
-# xArm CGPIO mapping from exported WebUI programs:
-# CI0-CI7 => 0-7
-# DI0-DI7 => 8-15
-# CO0-CO7 => 0-7
-# DO0-DO7 => 8-15
-#
-# Inputs:
-#   CI0 => E-Stop (handled by xArm controller via WebUI input config; not read in code)
-#   CI1 => Manual Mode (handled by xArm controller; we read state via CO1 / mode_code)
-#   CI2 => wired but unused (reserved)
-#   CI3 => not wired
-#   CI4 => Start / Resume button
-#   CI5 => Pause button
-#   CI6 => Stop button
-#   CI7 => not wired (reserved)
-#   DI0 => Board present sensor
-#   DI1 => Cartridge empty sensor (currently disabled via ENABLE_CARTRIDGE_CHECK)
-#   DI4 => Light curtain (1 = beam broken, 0 = clear)
-# Outputs:
-#   CO0..CO6 are configured at the xArm WebUI to mirror controller status
-#   CO7 => Dispenser trigger (driven by recipes)
-PHYSICAL_START_CI = 4         # CI4 => Start / Resume button (active high)
-PAUSE_BUTTON_CI = 5           # CI5 => Pause button (active high)
-STOP_BUTTON_CI = 6            # CI6 => Stop button (active high)
-MANUAL_MODE_CI = 1            # CI1 => Manual mode (firmware-handled, kept for reference)
-BOARD_PRESENT_DI = 0          # DI0 => CGPIO channel 8
-CARTRIDGE_EMPTY_DI = 1        # DI1 => CGPIO channel 9 (disabled below)
-LIGHT_CURTAIN_DI = 4          # DI4 => CGPIO channel 12, value 1 means beam broken
-LIGHT_CURTAIN_BROKEN_VALUE = 0
-ROBOT_ENABLED_CO = 0          # CO0 => Robot Enabled (status from controller)
-MANUAL_MODE_CO = 1            # CO1 => Manual Mode (status from controller)
-MOTION_STOPPED_CO = 2         # CO2 => Motion Stopped
-EMERGENCY_STOP_CO = 3         # CO3 => Emergency Stop Pressed
-WARNING_CO = 4                # CO4 => Warning
-ERROR_CO = 5                  # CO5 => Error
-ROBOT_MOVING_CO = 6           # CO6 => Robot Moving
-DISPENSER_TRIGGER_CO = 7      # CO7 => Dispenser trigger
+# Operator hardware buttons (active-high, momentary NO unless noted)
+PHYSICAL_START_CI   = 4   # CI4  Start / Resume
+PAUSE_BUTTON_CI     = 5   # CI5  Pause
+STOP_BUTTON_CI      = 6   # CI6  Stop
+RESET_BUTTON_CI     = 7   # CI7  Reset to home
+TUBE_CHANGE_BUTTON_CI = 2 # CI2  Tube change (swap epoxy cartridge)
+
+# Sensors
+BOARD_PRESENT_DI    = 0   # DI0  Board present photoelectric sensor
+CARTRIDGE_EMPTY_DI  = 1   # DI1  Cartridge empty (currently disabled)
+LIGHT_CURTAIN_DI    = 4   # DI4  Safety light curtain  (NC, 0 = broken)
+LIGHT_CURTAIN_BROKEN_VALUE = 0  # raw sensor value that means "beam broken"
+
+# Output — driven by recipes and our dispenser helpers
+DISPENSER_TRIGGER_CO = 7  # CO7  Epoxy dispenser solenoid
+
+# Recipe file stems
 MANUAL_DISPENSE_PROGRAM = "purge"
-RESET_PROGRAM = "reset"
-ENABLE_CARTRIDGE_CHECK = False
-DEFAULT_RECIPE = "PCB_466"
-XARM_IP = "10.40.17.196"  
+RESET_PROGRAM           = "reset"
+TUBE_CHANGE_PROGRAM     = "tube_change"
+
+# Misc config
+ENABLE_CARTRIDGE_CHECK    = False
+DEFAULT_RECIPE            = "PCB_466"
+XARM_IP                   = "10.40.17.196"
 RESET_ENABLE_WAIT_SECONDS = 5
 RESET_HOME_TIMEOUT_SECONDS = 7
+POLL_INTERVAL_MS          = 300  # QTimer period; change here if tuning
 
+
+# ---------------------------------------------------------------------------
+# Shared state dataclass (written from multiple threads; simple fields only)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SensorState:
-    board_present: bool = False
-    cartridge_empty: bool = False
-    manual_mode: bool = False
-    light_curtain_broken: bool = False
-    light_curtain_paused: bool = False
-    dispenser_on: bool = False
-    robot_running: bool = False
-    robot_paused: bool = False
-    robot_stopped: bool = False
-    robot_resetting: bool = False
-    cycle_count: int = 0
-    last_cycle_seconds: float = 0.0
+    board_present:        bool  = False
+    cartridge_empty:      bool  = False
+    manual_mode:          bool  = False
+    light_curtain_broken: bool  = False
+    light_curtain_paused: bool  = False   # paused specifically by curtain break
+    dispenser_on:         bool  = False
+    robot_running:        bool  = False
+    robot_paused:         bool  = False
+    robot_stopped:        bool  = False
+    robot_resetting:      bool  = False
+    cycle_count:          int   = 0
+    last_cycle_seconds:   float = 0.0
 
+
+# ---------------------------------------------------------------------------
+# OutputTrackingArmProxy
+# Wraps the raw XArmAPI object passed into recipes so that any CO7 write
+# is reflected in the controller's output_states / state.dispenser_on.
+# ---------------------------------------------------------------------------
 
 class OutputTrackingArmProxy:
-    def __init__(self, arm, controller):
-        object.__setattr__(self, '_arm', arm)
-        object.__setattr__(self, '_controller', controller)
+    """Thin proxy around XArmAPI; tracks CO7 (dispenser) state."""
+
+    def __init__(self, arm, controller: "RobotController"):
+        object.__setattr__(self, "_arm", arm)
+        object.__setattr__(self, "_controller", controller)
 
     def __getattr__(self, name):
         return getattr(self._arm, name)
@@ -109,96 +148,156 @@ class OutputTrackingArmProxy:
     def set_cgpio_digital(self, ionum, value, *args, **kwargs):
         code = self._arm.set_cgpio_digital(ionum, value, *args, **kwargs)
         if code == 0:
-            self._controller.output_states[int(ionum)] = bool(value)
+            ctrl = self._controller
+            ctrl.output_states[int(ionum)] = bool(value)
             if int(ionum) == DISPENSER_TRIGGER_CO:
-                self._controller.state.dispenser_on = bool(value)
+                ctrl.state.dispenser_on = bool(value)
         return code
 
 
+# ---------------------------------------------------------------------------
+# RobotController
+# ---------------------------------------------------------------------------
+
 class RobotController:
+    """
+    Thread-safe interface to the xArm.
+
+    SDK push-report callbacks keep _cb_snapshot up-to-date in real time.
+    A single get_cgpio_state() call per poll tick populates _gpio_cache for
+    all 16 digital-input channels so individual read_ci / read_di methods
+    return cached values without extra network round-trips.
+    """
+
     def __init__(self):
         self.state = SensorState()
-        self.current_recipe: Optional[str] = None
-        self.current_recipe_module = None
-        self.program_cycle_counts = {}
-        self.program_last_cycle_seconds = {}
-        self.arm = None
-        self.recipe_thread = None
-        self.reset_thread = None
-        self.last_reset_error: Optional[str] = None
-        self.cycle_abort_requested = False
-        self.output_states = {
-            DISPENSER_TRIGGER_CO: False,
-        }
+        self.current_recipe:        Optional[str]  = None
+        self.current_recipe_module                 = None
+        self.program_cycle_counts:  dict           = {}
+        self.program_last_cycle_seconds: dict      = {}
+        self.arm                                   = None
+        self.recipe_thread:   Optional[threading.Thread] = None
+        self.reset_thread:    Optional[threading.Thread] = None
+        self.last_reset_error: Optional[str]       = None
+        self.cycle_abort_requested: bool           = False
+        self.output_states: dict = {DISPENSER_TRIGGER_CO: False}
+
+        # SDK push-report callback cache (written from SDK thread, read from GUI thread)
+        self._cb_lock     = threading.Lock()
+        self._cb_snapshot: dict = {}  # keys: 'state', 'mode', 'error_code', 'warn_code', 'connected'
+
+        # GPIO bulk-read cache (refreshed once per poll tick)
+        self._gpio_cache: dict = {}   # {channel(0-15): bool}
+
         self.connect_robot()
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
 
     def connect_robot(self) -> None:
         try:
             from xarm.wrapper import XArmAPI
-
             self.arm = XArmAPI(XARM_IP)
-            self.arm.connect()
-            self._attach_output_tracking()
+            self._register_callbacks()
             self.arm.motion_enable(enable=True)
             self.arm.set_mode(0)
             self.arm.set_state(0)
         except Exception as exc:
-            print(f"Robot connection not active yet: {exc}")
+            print(f"Robot connection failed: {exc}")
             self.arm = None
 
-    def _attach_output_tracking(self) -> None:
-        if self.arm is None or getattr(self.arm, '_epoxy_output_tracking', False):
-            return
+    def disconnect_robot(self) -> None:
+        if self.arm is not None:
+            try:
+                self.dispenser_off_immediate()
+                self.arm.disconnect()
+            except Exception as exc:
+                print(f"Disconnect error: {exc}")
+            self.arm = None
 
-        original_set_cgpio_digital = self.arm.set_cgpio_digital
+    # ------------------------------------------------------------------
+    # SDK callbacks (called from SDK background thread)
+    # ------------------------------------------------------------------
 
-        def tracked_set_cgpio_digital(ionum, value, *args, **kwargs):
-            code = original_set_cgpio_digital(ionum, value, *args, **kwargs)
-            if code == 0:
-                self.output_states[int(ionum)] = bool(value)
-                if int(ionum) == DISPENSER_TRIGGER_CO:
-                    self.state.dispenser_on = bool(value)
-            return code
-
-        self.arm.set_cgpio_digital = tracked_set_cgpio_digital
-        self.arm._epoxy_output_tracking = True
-
-    def _read_cgpio_channel(self, channel: int) -> bool:
+    def _register_callbacks(self) -> None:
         if self.arm is None:
-            if channel == self.di_channel(BOARD_PRESENT_DI):
-                return self.state.board_present
-            if channel == self.di_channel(CARTRIDGE_EMPTY_DI):
-                return self.state.cartridge_empty
-            return False
+            return
+        self.arm.register_connect_changed_callback(self._on_connect_changed)
+        self.arm.register_state_changed_callback(self._on_state_changed)
+        self.arm.register_mode_changed_callback(self._on_mode_changed)
+        self.arm.register_error_warn_changed_callback(self._on_error_warn_changed)
+
+    def _on_connect_changed(self, data: dict) -> None:
+        with self._cb_lock:
+            self._cb_snapshot["connected"] = data.get("connected", False)
+        if not data.get("connected", True):
+            print("xArm disconnected (push report)")
+
+    def _on_state_changed(self, data: dict) -> None:
+        with self._cb_lock:
+            self._cb_snapshot["state"] = data.get("state")
+
+    def _on_mode_changed(self, data: dict) -> None:
+        with self._cb_lock:
+            self._cb_snapshot["mode"] = data.get("mode")
+
+    def _on_error_warn_changed(self, data: dict) -> None:
+        with self._cb_lock:
+            self._cb_snapshot["error_code"] = data.get("error_code", 0)
+            self._cb_snapshot["warn_code"]  = data.get("warn_code",  0)
+
+    # ------------------------------------------------------------------
+    # Bulk GPIO read  (one SDK call refreshes all 16 channels)
+    # ------------------------------------------------------------------
+
+    def refresh_gpio_cache(self) -> None:
+        """
+        Populate _gpio_cache with a single get_cgpio_state() call.
+        states[2] is a 16-bit integer: bit i = state of CGPIO channel i.
+        CI0-CI7 = channels 0-7, DI0-DI7 = channels 8-15.
+        Call this once per poll tick before reading any CI/DI.
+        """
+        if self.arm is None:
+            self._gpio_cache = {}
+            return
         try:
-            result = self.arm.get_cgpio_digital(channel)
-            if isinstance(result, (list, tuple)) and len(result) > 1:
-                return bool(result[1])
+            result = self.arm.get_cgpio_state()
+            # SDK returns (code, states) or just states depending on wrapper version
+            if isinstance(result, (list, tuple)) and len(result) >= 2:
+                code, states = result[0], result[1]
+            else:
+                self._gpio_cache = {}
+                return
+            if code != 0 or not isinstance(states, (list, tuple)) or len(states) < 3:
+                self._gpio_cache = {}
+                return
+            inp_word = int(states[2])
+            self._gpio_cache = {ch: bool((inp_word >> ch) & 1) for ch in range(16)}
         except Exception as exc:
-            print(f"Failed to read CGPIO channel {channel}: {exc}")
-        return False
+            print(f"get_cgpio_state failed: {exc}")
+            self._gpio_cache = {}
 
     @staticmethod
     def ci_channel(index: int) -> int:
-        return index
+        return index           # CI0-CI7 = channels 0-7
 
     @staticmethod
     def di_channel(index: int) -> int:
-        return 8 + index
+        return 8 + index       # DI0-DI7 = channels 8-15
 
-    @staticmethod
-    def co_channel(index: int) -> int:
-        return index
-
-    @staticmethod
-    def do_channel(index: int) -> int:
-        return 8 + index
+    def _read_cached(self, channel: int) -> bool:
+        return self._gpio_cache.get(channel, False)
 
     def read_ci(self, index: int) -> bool:
-        return self._read_cgpio_channel(self.ci_channel(index))
+        return self._read_cached(self.ci_channel(index))
 
     def read_di(self, index: int) -> bool:
-        return self._read_cgpio_channel(self.di_channel(index))
+        return self._read_cached(self.di_channel(index))
+
+    # ------------------------------------------------------------------
+    # Named sensor reads (all use cache after refresh_gpio_cache())
+    # ------------------------------------------------------------------
 
     def read_board_present(self) -> bool:
         return self.read_di(BOARD_PRESENT_DI)
@@ -215,27 +314,31 @@ class RobotController:
     def read_stop_button(self) -> bool:
         return self.read_ci(STOP_BUTTON_CI)
 
+    def read_reset_button(self) -> bool:
+        return self.read_ci(RESET_BUTTON_CI)
+
+    def read_tube_change_button(self) -> bool:
+        return self.read_ci(TUBE_CHANGE_BUTTON_CI)
+
     def read_light_curtain(self) -> bool:
-        broken = self.read_di(LIGHT_CURTAIN_DI) == bool(LIGHT_CURTAIN_BROKEN_VALUE)
+        """Returns True when the light curtain beam is broken."""
+        raw = self.read_di(LIGHT_CURTAIN_DI)
+        broken = (raw == bool(LIGHT_CURTAIN_BROKEN_VALUE))
         self.state.light_curtain_broken = broken
         return broken
 
     def read_manual_mode(self) -> bool:
-        manual_mode = self.read_robot_mode_code() == 2
-        self.state.manual_mode = manual_mode
-        return manual_mode
+        manual = self.read_robot_mode_code() == 2
+        self.state.manual_mode = manual
+        return manual
 
-    @staticmethod
-    def _extract_sdk_scalar(result) -> Optional[int]:
-        if isinstance(result, (list, tuple)):
-            if len(result) > 1 and isinstance(result[1], (int, bool)):
-                return int(result[1])
-            if len(result) == 1 and isinstance(result[0], (int, bool)):
-                return int(result[0])
-            return None
-        if isinstance(result, (int, bool)):
-            return int(result)
-        return None
+    # ------------------------------------------------------------------
+    # Robot state / mode / error — read from callback snapshot (no RPC)
+    # ------------------------------------------------------------------
+
+    def _cb_get(self, key):
+        with self._cb_lock:
+            return self._cb_snapshot.get(key)
 
     def read_robot_state_code(self) -> Optional[int]:
         if self.arm is None:
@@ -246,62 +349,65 @@ class RobotController:
             if self.state.robot_running:
                 return 1
             return 2
-        try:
-            state_code = self._extract_sdk_scalar(self.arm.get_state())
-            if state_code is not None:
-                return state_code
-        except Exception:
-            pass
-        state_attr = getattr(self.arm, 'state', None)
-        return int(state_attr) if isinstance(state_attr, (int, bool)) else None
+        val = self._cb_get("state")
+        if val is None:
+            val = getattr(self.arm, "state", None)
+        return int(val) if isinstance(val, (int, bool)) else None
 
     def read_robot_mode_code(self) -> Optional[int]:
         if self.arm is None:
             return 2 if self.state.manual_mode else 0
-        try:
-            mode_code = self._extract_sdk_scalar(self.arm.get_mode())
-            if mode_code is not None:
-                return mode_code
-        except Exception:
-            pass
-        mode_attr = getattr(self.arm, 'mode', None)
-        return int(mode_attr) if isinstance(mode_attr, (int, bool)) else None
+        val = self._cb_get("mode")
+        if val is None:
+            val = getattr(self.arm, "mode", None)
+        return int(val) if isinstance(val, (int, bool)) else None
 
     def read_warning_code(self) -> int:
-        warn_code = getattr(self.arm, 'warn_code', 0) if self.arm is not None else 0
-        return int(warn_code) if isinstance(warn_code, (int, bool)) else 0
+        val = self._cb_get("warn_code")
+        if val is None:
+            val = getattr(self.arm, "warn_code", 0) if self.arm else 0
+        return int(val) if isinstance(val, (int, bool)) else 0
 
     def read_error_code(self) -> int:
-        error_code = getattr(self.arm, 'error_code', 0) if self.arm is not None else 0
-        return int(error_code) if isinstance(error_code, (int, bool)) else 0
+        val = self._cb_get("error_code")
+        if val is None:
+            val = getattr(self.arm, "error_code", 0) if self.arm else 0
+        return int(val) if isinstance(val, (int, bool)) else 0
 
     def is_dispenser_on(self) -> bool:
         return bool(self.output_states.get(DISPENSER_TRIGGER_CO, False))
 
+    # ------------------------------------------------------------------
+    # Output control
+    # ------------------------------------------------------------------
+
     def set_co(self, index: int, state: bool, sync: bool = True) -> None:
-        channel = self.co_channel(index)
+        channel = index  # CO channels share indices with CGPIO channels
         if self.arm is None:
             self.output_states[index] = bool(state)
             if index == DISPENSER_TRIGGER_CO:
                 self.state.dispenser_on = bool(state)
-            print(f"CO{index} / channel {channel} -> {'ON' if state else 'OFF'}")
             return
         try:
             code = self.arm.set_cgpio_digital(channel, int(state), delay_sec=0, sync=sync)
             if code != 0:
-                print(f"Failed to set CO{index}, code={code}")
+                print(f"set_co CO{index} failed, code={code}")
                 return
             self.output_states[index] = bool(state)
             if index == DISPENSER_TRIGGER_CO:
                 self.state.dispenser_on = bool(state)
         except Exception as exc:
-            print(f"Failed to set CO{index}: {exc}")
+            print(f"set_co CO{index} exception: {exc}")
 
     def dispenser_off(self) -> None:
-        self.set_co(DISPENSER_TRIGGER_CO, False)
+        self.set_co(DISPENSER_TRIGGER_CO, False, sync=True)
 
     def dispenser_off_immediate(self) -> None:
         self.set_co(DISPENSER_TRIGGER_CO, False, sync=False)
+
+    # ------------------------------------------------------------------
+    # Recipe loading and execution
+    # ------------------------------------------------------------------
 
     def load_recipe(self, recipe_name: str, recipe_path: Path) -> None:
         spec = importlib.util.spec_from_file_location(recipe_name, recipe_path)
@@ -309,20 +415,16 @@ class RobotController:
             raise RuntimeError(f"Could not load recipe: {recipe_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.current_recipe = recipe_name
+        self.current_recipe        = recipe_name
         self.current_recipe_module = module
         self.program_cycle_counts.setdefault(recipe_name, 0)
         self.program_last_cycle_seconds.setdefault(recipe_name, 0.0)
 
     def get_program_cycle_count(self, recipe_name: Optional[str]) -> int:
-        if not recipe_name:
-            return 0
-        return self.program_cycle_counts.get(recipe_name, 0)
+        return self.program_cycle_counts.get(recipe_name, 0) if recipe_name else 0
 
     def get_program_last_cycle_seconds(self, recipe_name: Optional[str]) -> float:
-        if not recipe_name:
-            return 0.0
-        return self.program_last_cycle_seconds.get(recipe_name, 0.0)
+        return self.program_last_cycle_seconds.get(recipe_name, 0.0) if recipe_name else 0.0
 
     def _run_loaded_recipe(self) -> None:
         self._execute_loaded_program(count_cycle=True)
@@ -332,23 +434,23 @@ class RobotController:
     def _execute_loaded_program(self, count_cycle: bool = True) -> None:
         start_time = time.perf_counter()
         try:
-            module = self.current_recipe_module
+            module      = self.current_recipe_module
             recipe_name = self.current_recipe
             if module is None:
                 raise RuntimeError("No recipe module loaded.")
-            if hasattr(module, 'RobotMain'):
-                recipe_arm = OutputTrackingArmProxy(self.arm, self) if self.arm is not None else None
-                robot_main = module.RobotMain(recipe_arm)
-                robot_main.run()
-            elif hasattr(module, 'run'):
+            if hasattr(module, "RobotMain"):
+                proxy = OutputTrackingArmProxy(self.arm, self) if self.arm is not None else None
+                module.RobotMain(proxy).run()
+            elif hasattr(module, "run"):
                 module.run(self)
             else:
-                raise RuntimeError("Recipe file has neither RobotMain nor run().")
+                raise RuntimeError("Recipe has neither RobotMain nor run().")
             if not self.cycle_abort_requested and recipe_name:
                 elapsed = time.perf_counter() - start_time
                 self.state.last_cycle_seconds = elapsed
                 self.program_last_cycle_seconds[recipe_name] = elapsed
-                self.program_cycle_counts[recipe_name] = self.program_cycle_counts.get(recipe_name, 0) + 1
+                self.program_cycle_counts[recipe_name] = \
+                    self.program_cycle_counts.get(recipe_name, 0) + 1
                 if count_cycle:
                     self.state.cycle_count += 1
         except Exception as exc:
@@ -367,75 +469,105 @@ class RobotController:
         if active_thread is None or not active_thread.is_alive():
             self.recipe_thread = None
             return
-
         if self.arm is not None:
-            self.arm.set_state(0)
-            time.sleep(0.1)
-            self.dispenser_off_immediate()
-            self.arm.set_state(4)
+            try:
+                self.arm.set_state(0)
+                time.sleep(0.05)
+                self.dispenser_off_immediate()
+                self.arm.set_state(4)
+            except Exception as exc:
+                print(f"_terminate_active_cycle arm commands failed: {exc}")
         else:
             self.dispenser_off()
-
         active_thread.join(timeout=join_timeout)
         if active_thread.is_alive():
             raise RuntimeError("Timed out waiting for active recipe to stop.")
-
         self.recipe_thread = None
+
+    # ------------------------------------------------------------------
+    # Cycle control
+    # ------------------------------------------------------------------
 
     def start_cycle(self) -> None:
         if self.state.robot_paused and self._cycle_active():
+            # Resume a paused cycle
             if self.arm is not None:
                 try:
                     self.arm.set_state(0)
                 except Exception as exc:
                     raise RuntimeError(f"Resume command failed: {exc}") from exc
-            self.last_reset_error = None
-            self.cycle_abort_requested = False
-            self.state.robot_running = True
-            self.state.robot_paused = False
-            self.state.robot_stopped = False
+            self.last_reset_error       = None
+            self.cycle_abort_requested  = False
+            self.state.robot_running    = True
+            self.state.robot_paused     = False
+            self.state.robot_stopped    = False
             return
 
         if ENABLE_CARTRIDGE_CHECK and self.read_cartridge_empty():
-            raise RuntimeError("Cannot start cycle: dispenser cartridge is empty.")
+            raise RuntimeError("Cannot start: dispenser cartridge is empty.")
         if not self.read_board_present():
-            raise RuntimeError("Cannot start cycle: board not present.")
+            raise RuntimeError("Cannot start: board not detected in fixture.")
         if self.current_recipe_module is None:
-            raise RuntimeError("No recipe loaded.")
+            raise RuntimeError("No recipe loaded. Select a program first.")
         if self._reset_active() or self.state.robot_resetting:
-            raise RuntimeError("Robot reset is in progress.")
+            raise RuntimeError("Cannot start: robot reset is in progress.")
         if self._cycle_active():
             raise RuntimeError("A recipe is already running.")
 
-        self.last_reset_error = None
+        self.last_reset_error      = None
         self.cycle_abort_requested = False
-        self.state.robot_running = True
-        self.state.robot_paused = False
-        self.state.robot_stopped = False
-        self.recipe_thread = threading.Thread(target=self._run_loaded_recipe, daemon=True)
+        self.state.robot_running   = True
+        self.state.robot_paused    = False
+        self.state.robot_stopped   = False
+        self.recipe_thread = threading.Thread(
+            target=self._run_loaded_recipe, daemon=True, name="recipe"
+        )
         self.recipe_thread.start()
 
     def run_manual_dispense(self) -> None:
         if self._reset_active() or self.state.robot_resetting:
             raise RuntimeError("Robot reset is in progress.")
         if self._cycle_active():
-            raise RuntimeError("Cannot run manual dispense while another program is active.")
-        manual_recipe = RECIPES_DIR / f"{MANUAL_DISPENSE_PROGRAM}.py"
-        if not manual_recipe.exists():
-            raise RuntimeError(f"Manual dispense program not found: {manual_recipe}")
-        self.load_recipe(MANUAL_DISPENSE_PROGRAM, manual_recipe)
-        self.last_reset_error = None
+            raise RuntimeError("Another program is already active.")
+        recipe_path = RECIPES_DIR / f"{MANUAL_DISPENSE_PROGRAM}.py"
+        if not recipe_path.exists():
+            raise RuntimeError(f"Purge program not found: {recipe_path}")
+        self.load_recipe(MANUAL_DISPENSE_PROGRAM, recipe_path)
+        self._start_recipe_thread()
+
+    def run_tube_change(self) -> None:
+        if self._reset_active() or self.state.robot_resetting:
+            raise RuntimeError("Robot reset is in progress.")
+        if self._cycle_active():
+            raise RuntimeError("Another program is already active.")
+        if self.state.manual_mode:
+            raise RuntimeError("Switch out of manual mode before running tube change.")
+        if self.state.light_curtain_broken:
+            raise RuntimeError("Light curtain is broken. Clear the area first.")
+        recipe_path = RECIPES_DIR / f"{TUBE_CHANGE_PROGRAM}.py"
+        if not recipe_path.exists():
+            raise RuntimeError(
+                f"Tube change program not found.\n\n"
+                f"Create a '{TUBE_CHANGE_PROGRAM}.py' file in the recipes folder."
+            )
+        self.load_recipe(TUBE_CHANGE_PROGRAM, recipe_path)
+        self._start_recipe_thread()
+
+    def _start_recipe_thread(self) -> None:
+        self.last_reset_error      = None
         self.cycle_abort_requested = False
-        self.state.robot_running = True
-        self.state.robot_paused = False
-        self.state.robot_stopped = False
-        self.recipe_thread = threading.Thread(target=self._run_loaded_recipe, daemon=True)
+        self.state.robot_running   = True
+        self.state.robot_paused    = False
+        self.state.robot_stopped   = False
+        self.recipe_thread = threading.Thread(
+            target=self._run_loaded_recipe, daemon=True, name="recipe"
+        )
         self.recipe_thread.start()
 
     def pause_immediate(self) -> None:
         if self.state.robot_resetting:
-            raise RuntimeError("Robot reset is in progress.")
-        self.state.robot_paused = True
+            raise RuntimeError("Cannot pause: robot reset is in progress.")
+        self.state.robot_paused  = True
         self.state.robot_running = False
         self.state.robot_stopped = False
         self.dispenser_off_immediate()
@@ -447,54 +579,82 @@ class RobotController:
 
     def stop_cycle(self) -> None:
         if self.state.robot_resetting:
-            raise RuntimeError("Robot reset is in progress.")
-
-        self.last_reset_error = None
+            raise RuntimeError("Cannot stop: robot reset is in progress.")
+        self.last_reset_error      = None
         self.cycle_abort_requested = True
-        self.state.robot_running = False
-        self.state.robot_paused = False
-        self.state.robot_stopped = True
+        self.state.robot_running   = False
+        self.state.robot_paused    = False
+        self.state.robot_stopped   = True
         self._terminate_active_cycle()
+
+    def abort_for_manual_mode(self) -> None:
+        """
+        Called when manual mode is engaged while a cycle is running.
+        The firmware stops arm motion; we clean up software state so the
+        operator returns to STOPPED (not a phantom-running cycle) when
+        they release manual mode.
+        """
+        self.cycle_abort_requested = True
+        self.state.robot_running   = False
+        self.state.robot_paused    = False
+        self.state.robot_stopped   = True
+        self.state.light_curtain_paused = False
+        try:
+            self.dispenser_off_immediate()
+        except Exception as exc:
+            print(f"Dispenser off during manual-mode abort failed: {exc}")
+        # Signal the recipe thread — it will exit on its next motion attempt
+        if self.recipe_thread is not None and not self.recipe_thread.is_alive():
+            self.recipe_thread = None
 
     def reset_to_initial_position(self) -> None:
         if self._reset_active() or self.state.robot_resetting:
-            raise RuntimeError("Robot reset is already in progress.")
+            raise RuntimeError("Reset is already in progress.")
 
-        self.last_reset_error = None
+        self.last_reset_error      = None
         self.cycle_abort_requested = True
-        self.state.robot_running = False
-        self.state.robot_paused = False
-        self.state.robot_stopped = False
+        self.state.robot_running   = False
+        self.state.robot_paused    = False
+        self.state.robot_stopped   = False
         self.state.robot_resetting = True
 
         def worker():
             try:
                 if self.arm is None:
                     return
-
                 self._terminate_active_cycle()
+
+                # Clear errors so the controller can move again after a fault
+                try:
+                    self.arm.clean_error()
+                    self.arm.clean_warn()
+                    self.arm.motion_enable(enable=True)
+                    self.arm.set_mode(0)
+                    self.arm.set_state(0)
+                except Exception as exc:
+                    print(f"Re-enable during reset failed: {exc}")
+
                 reset_recipe = RECIPES_DIR / f"{RESET_PROGRAM}.py"
                 if not reset_recipe.exists():
                     raise RuntimeError(f"Reset program not found: {reset_recipe}")
-
                 self.load_recipe(RESET_PROGRAM, reset_recipe)
                 self._execute_loaded_program(count_cycle=False)
             except Exception as exc:
                 self.last_reset_error = str(exc)
-                print(f"Reset command failed: {exc}")
+                print(f"Reset failed: {exc}")
             finally:
-                self.state.robot_running = False
-                self.state.robot_paused = False
+                self.state.robot_running   = False
+                self.state.robot_paused    = False
                 self.state.robot_resetting = False
                 self.recipe_thread = None
 
-        self.reset_thread = threading.Thread(target=worker, daemon=True)
+        self.reset_thread = threading.Thread(target=worker, daemon=True, name="reset")
         self.reset_thread.start()
 
     def emergency_stop(self) -> None:
         self.cycle_abort_requested = True
-        self.state.robot_paused = True
-        self.state.robot_running = False
+        self.state.robot_paused    = True
+        self.state.robot_running   = False
         self.dispenser_off()
         if self.arm is not None:
             try:
@@ -502,6 +662,10 @@ class RobotController:
             except Exception as exc:
                 print(f"Emergency stop command failed: {exc}")
 
+
+# ---------------------------------------------------------------------------
+# GUI helpers
+# ---------------------------------------------------------------------------
 
 class GlowPanel(QFrame):
     def __init__(self, parent=None):
@@ -512,14 +676,12 @@ class GlowPanel(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(1, 1, -1, -1)
-
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0, QColor("#0f172a"))
-        gradient.setColorAt(1, QColor("#0b1220"))
-        painter.setBrush(gradient)
+        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        grad.setColorAt(0, QColor("#0f172a"))
+        grad.setColorAt(1, QColor("#0b1220"))
+        painter.setBrush(grad)
         painter.setPen(QPen(QColor("#223047"), 1))
         painter.drawRoundedRect(rect, 24, 24)
-
         super().paintEvent(event)
 
 
@@ -586,29 +748,45 @@ class MetricCard(QFrame):
         self.value_label.setText(value)
 
 
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
 class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
         self.robot = RobotController()
         self.recipe_dir = RECIPES_DIR
         self.recipe_dir.mkdir(exist_ok=True)
-        # Ignore any held physical inputs on startup until they are released once.
-        # All hardware buttons fire on rising edge (False -> True transition).
-        self.start_latch = self.robot.read_physical_start()
-        self.pause_latch = self.robot.read_pause_button()
-        self.stop_latch = self.robot.read_stop_button()
-        self.curtain_latch = self.robot.read_light_curtain()
-        self.curtain_warning_active = False
+
+        # Prime the GPIO cache so initial latch values are accurate
+        self.robot.refresh_gpio_cache()
+
+        # Rising-edge latches — initialise to current state so a button held
+        # at startup is ignored until it is released and pressed again.
+        self.start_latch       = self.robot.read_physical_start()
+        self.pause_latch       = self.robot.read_pause_button()
+        self.stop_latch        = self.robot.read_stop_button()
+        self.reset_latch       = self.robot.read_reset_button()
+        self.tube_change_latch = self.robot.read_tube_change_button()
+        self.curtain_latch     = self.robot.read_light_curtain()
+        self.manual_mode_latch = self.robot.read_manual_mode()
+
         self.status_cards_compact: Optional[bool] = None
 
         self.setWindowTitle("Dispensing Cell HMI")
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
-            available = screen.availableGeometry()
-            self.resize(max(1280, min(available.width(), 1600)), max(720, min(available.height(), 900)))
+            avail = screen.availableGeometry()
+            self.resize(
+                max(1280, min(avail.width(),  1600)),
+                max(720,  min(avail.height(), 900)),
+            )
         else:
             self.resize(1600, 900)
 
+        # ---------- layout ----------
         root = QWidget()
         root.setObjectName("Root")
         self.setCentralWidget(root)
@@ -616,6 +794,7 @@ class MainWindow(QMainWindow):
         self.root_layout.setContentsMargins(28, 28, 28, 28)
         self.root_layout.setSpacing(18)
 
+        # Hero bar
         hero = GlowPanel()
         self.hero_layout = QHBoxLayout(hero)
         self.hero_layout.setContentsMargins(28, 22, 28, 22)
@@ -623,22 +802,19 @@ class MainWindow(QMainWindow):
 
         title_block = QVBoxLayout()
         title_block.setSpacing(4)
-
         eyebrow = QLabel("DISPENSING ROBOT")
         eyebrow.setObjectName("Eyebrow")
         title_block.addWidget(eyebrow)
-
         self.live_commentary = QLabel("Waiting for board")
         self.live_commentary.setObjectName("LiveCommentary")
         self.live_commentary.setWordWrap(True)
         title_block.addWidget(self.live_commentary)
-
         self.hero_layout.addLayout(title_block, 1)
 
         metrics_wrap = QHBoxLayout()
         metrics_wrap.setSpacing(12)
-        self.cycle_count_card = MetricCard("Program Count", "0", "blue")
-        self.last_cycle_card = MetricCard("Last Cycle Time", "--:--", "purple")
+        self.cycle_count_card = MetricCard("Program Count", "0",    "blue")
+        self.last_cycle_card  = MetricCard("Last Cycle Time", "--:--", "purple")
         metrics_wrap.addWidget(self.cycle_count_card)
         metrics_wrap.addWidget(self.last_cycle_card)
         self.hero_layout.addLayout(metrics_wrap)
@@ -648,15 +824,16 @@ class MainWindow(QMainWindow):
         self.hero_state.setAlignment(Qt.AlignCenter)
         self.hero_state.setMinimumWidth(210)
         self.hero_layout.addWidget(self.hero_state)
-
         self.root_layout.addWidget(hero)
 
+        # Three-column content
         self.content_layout = QGridLayout()
         self.content_layout.setHorizontalSpacing(18)
         self.content_layout.setVerticalSpacing(18)
         self.root_layout.addLayout(self.content_layout, 1)
 
-        left_panel = GlowPanel()
+        # Left panel — program selection
+        left_panel  = GlowPanel()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(24, 24, 24, 24)
         left_layout.setSpacing(16)
@@ -666,28 +843,21 @@ class MainWindow(QMainWindow):
         recipe_title.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(recipe_title)
 
-        recipe_help = QLabel("")
-        recipe_help.setObjectName("SectionSubtext")
-        recipe_help.setWordWrap(True)
-        recipe_help.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(recipe_help)
+        left_layout.addWidget(QLabel(""))   # spacer label keeps height stable
 
         info_bar = QFrame()
         info_bar.setObjectName("InfoBar")
         info_bar_layout = QVBoxLayout(info_bar)
         info_bar_layout.setContentsMargins(18, 16, 18, 16)
         info_bar_layout.setSpacing(6)
-
         self.loaded_program_label = QLabel(DEFAULT_RECIPE)
         self.loaded_program_label.setObjectName("LoadedProgramTile")
         self.loaded_program_label.setAlignment(Qt.AlignCenter)
         info_bar_layout.addWidget(self.loaded_program_label)
-
         hint_label = QLabel("Currently loaded program")
         hint_label.setObjectName("InfoLabel")
         hint_label.setAlignment(Qt.AlignCenter)
         info_bar_layout.addWidget(hint_label)
-
         left_layout.addWidget(info_bar)
 
         self.recipe_combo = QComboBox()
@@ -696,19 +866,17 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.recipe_combo)
 
         left_layout.addStretch()
-
         self.refresh_button = QPushButton("Refresh Programs")
         self.refresh_button.setObjectName("SecondaryButton")
         self.refresh_button.clicked.connect(self.refresh_recipes)
         left_layout.addWidget(self.refresh_button)
-
         self.content_layout.addWidget(left_panel, 0, 1)
 
-        middle_panel = GlowPanel()
+        # Middle panel — status cards
+        middle_panel  = GlowPanel()
         middle_layout = QVBoxLayout(middle_panel)
         middle_layout.setContentsMargins(24, 24, 24, 24)
         middle_layout.setSpacing(16)
-
         status_title = QLabel("Live Machine Status")
         status_title.setObjectName("SectionTitle")
         status_title.setAlignment(Qt.AlignCenter)
@@ -718,57 +886,49 @@ class MainWindow(QMainWindow):
         self.status_cards.setHorizontalSpacing(14)
         self.status_cards.setVerticalSpacing(14)
 
-        self.program_card = StatusCard("Loaded Program", "Current recipe")
-        self.board_card = StatusCard("Board Presence", "DI0 board sensor")
-        self.dispenser_card = StatusCard("Dispenser", "CO7 epoxy trigger")
-        self.motion_card = StatusCard("Robot Motion", "Controller status")
-        self.run_card = StatusCard("Robot State", "Controller state / mode")
-        self.light_curtain_card = StatusCard("Light Curtain", "DI4 safety beam")
-        self.manual_card = StatusCard("Manual Mode", "Controller mode")
-        self.warning_card = StatusCard("Warning", "CO4 / warn_code")
-        self.error_card = StatusCard("Error", "CO5 / error_code")
+        self.program_card      = StatusCard("Loaded Program",  "Current recipe")
+        self.board_card        = StatusCard("Board Presence",  "DI0 board sensor")
+        self.dispenser_card    = StatusCard("Dispenser",       "CO7 epoxy trigger")
+        self.motion_card       = StatusCard("Robot Motion",    "Controller status")
+        self.run_card          = StatusCard("Robot State",     "State / mode")
+        self.light_curtain_card = StatusCard("Light Curtain",  "DI4 safety beam")
+        self.manual_card       = StatusCard("Manual Mode",     "Controller mode")
+        self.warning_card      = StatusCard("Warning",         "warn_code")
+        self.error_card        = StatusCard("Error",           "error_code")
         self.status_card_widgets = (
-            self.program_card,
-            self.board_card,
-            self.dispenser_card,
-            self.motion_card,
-            self.run_card,
-            self.light_curtain_card,
-            self.manual_card,
-            self.warning_card,
-            self.error_card,
+            self.program_card, self.board_card,  self.dispenser_card,
+            self.motion_card,  self.run_card,    self.light_curtain_card,
+            self.manual_card,  self.warning_card, self.error_card,
         )
         for card in self.status_card_widgets:
             card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-
         middle_layout.addLayout(self.status_cards)
         middle_layout.addStretch()
-
         self.content_layout.addWidget(middle_panel, 0, 0)
 
-        right_panel = GlowPanel()
+        # Right panel — operator buttons
+        right_panel  = GlowPanel()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(24, 24, 24, 24)
         right_layout.setSpacing(16)
-
         control_title = QLabel("Operator Controls")
         control_title.setObjectName("SectionTitle")
         control_title.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(control_title)
 
-        self.start_button = QPushButton("Start Cycle")
+        self.start_button         = QPushButton("Start Cycle")
         self.start_button.setObjectName("StartButton")
         self.start_button.clicked.connect(self.start_cycle)
 
-        self.pause_button = QPushButton("Pause")
+        self.pause_button         = QPushButton("Pause")
         self.pause_button.setObjectName("PauseButton")
         self.pause_button.clicked.connect(self.pause_cycle)
 
-        self.stop_button = QPushButton("Stop")
+        self.stop_button          = QPushButton("Stop")
         self.stop_button.setObjectName("StopButton")
         self.stop_button.clicked.connect(self.stop_cycle)
 
-        self.reset_button = QPushButton("Reset")
+        self.reset_button         = QPushButton("Reset")
         self.reset_button.setObjectName("ResetButton")
         self.reset_button.clicked.connect(self.reset_system)
 
@@ -776,19 +936,22 @@ class MainWindow(QMainWindow):
         self.manual_dispense_button.setObjectName("PurgeButton")
         self.manual_dispense_button.clicked.connect(self.run_manual_dispense)
 
+        self.tube_change_button   = QPushButton("Tube Change")
+        self.tube_change_button.setObjectName("TubeChangeButton")
+        self.tube_change_button.clicked.connect(self.run_tube_change)
+
         self.primary_buttons = (
             self.start_button,
             self.pause_button,
             self.stop_button,
             self.reset_button,
             self.manual_dispense_button,
+            self.tube_change_button,
         )
-
         for btn in self.primary_buttons:
             btn.setMinimumHeight(68)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             right_layout.addWidget(btn)
-
         right_layout.addStretch()
         self.content_layout.addWidget(right_panel, 0, 2)
 
@@ -796,27 +959,31 @@ class MainWindow(QMainWindow):
         self.content_layout.setColumnStretch(1, 1)
         self.content_layout.setColumnStretch(2, 1)
 
+        # Populate recipe list and select default
         self.refresh_recipes()
-        initial_recipe_index = self.recipe_combo.findText(DEFAULT_RECIPE)
-        if initial_recipe_index >= 0:
-            self.recipe_combo.setCurrentIndex(initial_recipe_index)
+        idx = self.recipe_combo.findText(DEFAULT_RECIPE)
+        if idx >= 0:
+            self.recipe_combo.setCurrentIndex(idx)
             self.update_loaded_program_display()
 
+        # Poll timer
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.update_status)
-        self.poll_timer.start(300)
+        self.poll_timer.start(POLL_INTERVAL_MS)
 
         self.apply_styles()
         self.update_responsive_layout(force=True)
         self.update_status()
 
+    # ------------------------------------------------------------------
+    # Layout helpers
+    # ------------------------------------------------------------------
+
     def format_cycle_time(self, seconds: float) -> str:
         if seconds <= 0:
             return "--:--"
         whole = int(round(seconds))
-        mins = whole // 60
-        secs = whole % 60
-        return f"{mins:02d}:{secs:02d}"
+        return f"{whole // 60:02d}:{whole % 60:02d}"
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -826,31 +993,25 @@ class MainWindow(QMainWindow):
         compact = self.width() >= self.height() or self.height() < 900
         if not force and compact == self.status_cards_compact:
             return
-
         self.status_cards_compact = compact
         dense = self.height() <= 1080 or self.width() <= 1600
 
         while self.status_cards.count():
             self.status_cards.takeAt(0)
+        cols = 3
+        for i, card in enumerate(self.status_card_widgets):
+            self.status_cards.addWidget(card, i // cols, i % cols)
+        for c in range(cols):
+            self.status_cards.setColumnStretch(c, 1)
 
-        columns = 3
-        for index, card in enumerate(self.status_card_widgets):
-            row = index // columns
-            column = index % columns
-            self.status_cards.addWidget(card, row, column)
-
-        for column in range(columns):
-            self.status_cards.setColumnStretch(column, 1)
-
-        status_card_height = 128 if dense else 142
+        card_h = 128 if dense else 142
         for card in self.status_card_widgets:
-            card.setMinimumHeight(status_card_height)
-
+            card.setMinimumHeight(card_h)
         for btn in self.primary_buttons:
             btn.setMinimumHeight(46 if dense else (52 if compact else 62))
         self.reset_button.setMinimumHeight(42 if dense else (46 if compact else 54))
-
         self.hero_state.setMinimumWidth(150 if dense else (180 if compact else 210))
+
         if dense:
             self.root_layout.setContentsMargins(14, 14, 14, 14)
             self.root_layout.setSpacing(10)
@@ -873,260 +1034,215 @@ class MainWindow(QMainWindow):
             self.content_layout.setHorizontalSpacing(18)
             self.content_layout.setVerticalSpacing(18)
 
+    # ------------------------------------------------------------------
+    # Stylesheet
+    # ------------------------------------------------------------------
+
     def apply_styles(self):
-        self.setStyleSheet(
-            """
+        self.setStyleSheet("""
             QMainWindow, QWidget#Root {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #030712, stop:1 #111827);
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #030712,stop:1 #111827);
             }
             QWidget {
                 color: #e5eefc;
                 font-family: Segoe UI, Inter, Arial, sans-serif;
                 font-size: 14px;
             }
-            QLabel {
-                background: transparent;
-            }
+            QLabel { background: transparent; }
             QLabel#Eyebrow {
-                font-size: 11px;
-                font-weight: 700;
-                color: #7dd3fc;
-                letter-spacing: 1px;
+                font-size: 11px; font-weight: 700;
+                color: #7dd3fc; letter-spacing: 1px;
             }
             QLabel#LiveCommentary {
-                font-size: 18px;
-                font-weight: 700;
-                color: #f8fbff;
-                max-width: 680px;
+                font-size: 18px; font-weight: 700;
+                color: #f8fbff; max-width: 680px;
             }
             QLabel#HeroState {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0f766e, stop:1 #0369a1);
-                border: 1px solid #38bdf8;
-                border-radius: 22px;
-                padding: 14px;
-                font-size: 18px;
-                font-weight: 800;
-                color: white;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #0f766e,stop:1 #0369a1);
+                border: 1px solid #38bdf8; border-radius: 22px; padding: 14px;
+                font-size: 18px; font-weight: 800; color: white;
             }
             QLabel#SectionTitle {
-                font-size: 18px;
-                font-weight: 700;
-                color: #f8fbff;
+                font-size: 18px; font-weight: 700; color: #f8fbff;
             }
             QLabel#SectionSubtext {
-                font-size: 12px;
-                color: #93a7c2;
-                min-height: 0px;
+                font-size: 12px; color: #93a7c2; min-height: 0px;
             }
             QFrame#InfoBar {
-                background: rgba(15, 23, 42, 0.88);
-                border: 1px solid #27364d;
-                border-radius: 18px;
-            }
-            QLabel#InfoLabelStrong {
-                font-size: 14px;
-                font-weight: 700;
-                color: #dbeafe;
+                background: rgba(15,23,42,0.88);
+                border: 1px solid #27364d; border-radius: 18px;
             }
             QLabel#LoadedProgramTile {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #082f49, stop:1 #0f4c81);
-                border: 1px solid #38bdf8;
-                border-radius: 18px;
-                padding: 18px 14px;
-                font-size: 24px;
-                font-weight: 800;
-                color: #f8fbff;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #082f49,stop:1 #0f4c81);
+                border: 1px solid #38bdf8; border-radius: 18px;
+                padding: 18px 14px; font-size: 24px; font-weight: 800; color: #f8fbff;
             }
-            QLabel#InfoLabel {
-                font-size: 12px;
-                color: #8ea0b8;
-            }
+            QLabel#InfoLabel { font-size: 12px; color: #8ea0b8; }
             QFrame#StatusCard {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0f172a, stop:1 #172235);
-                border: 1px solid #25344b;
-                border-radius: 22px;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #0f172a,stop:1 #172235);
+                border: 1px solid #25344b; border-radius: 22px;
             }
-            QLabel#StatusDot {
-                font-size: 22px;
-                color: #475569;
-            }
-            QLabel#StatusDot[ok="true"] {
-                color: #4ade80;
-            }
-            QLabel#StatusDot[ok="false"] {
-                color: #fb7185;
-            }
-            QLabel#CardTitle {
-                font-size: 12px;
-                font-weight: 700;
-                color: #e2e8f0;
-            }
-            QLabel#CardValue {
-                font-size: 24px;
-                font-weight: 800;
-                color: #f8fbff;
-            }
-            QLabel#CardValue[ok="true"] {
-                color: #4ade80;
-            }
-            QLabel#CardValue[ok="false"] {
-                color: #fb7185;
-            }
-            QLabel#CardSubtitle {
-                font-size: 11px;
-                color: #8ca0b8;
-                min-height: 0px;
-            }
+            QLabel#StatusDot { font-size: 22px; color: #475569; }
+            QLabel#StatusDot[ok="true"]  { color: #4ade80; }
+            QLabel#StatusDot[ok="false"] { color: #fb7185; }
+            QLabel#CardTitle  { font-size: 12px; font-weight: 700; color: #e2e8f0; }
+            QLabel#CardValue  { font-size: 24px; font-weight: 800; color: #f8fbff; }
+            QLabel#CardValue[ok="true"]  { color: #4ade80; }
+            QLabel#CardValue[ok="false"] { color: #fb7185; }
+            QLabel#CardSubtitle { font-size: 11px; color: #8ca0b8; min-height: 0px; }
             QFrame#MetricCard_blue, QFrame#MetricCard_purple {
-                border-radius: 20px;
-                min-width: 150px;
+                border-radius: 20px; min-width: 150px;
             }
             QFrame#MetricCard_blue {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #082f49, stop:1 #0f4c81);
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #082f49,stop:1 #0f4c81);
                 border: 1px solid #38bdf8;
             }
             QFrame#MetricCard_purple {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #312e81, stop:1 #5b21b6);
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #312e81,stop:1 #5b21b6);
                 border: 1px solid #a78bfa;
             }
             QLabel#MetricTitle {
-                font-size: 11px;
-                font-weight: 700;
-                color: rgba(255,255,255,0.78);
-                text-transform: uppercase;
+                font-size: 11px; font-weight: 700;
+                color: rgba(255,255,255,0.78); text-transform: uppercase;
             }
-            QLabel#MetricValue {
-                font-size: 22px;
-                font-weight: 800;
-                color: white;
-            }
+            QLabel#MetricValue { font-size: 22px; font-weight: 800; color: white; }
             QComboBox#RecipeCombo {
-                min-height: 44px;
-                border-radius: 18px;
-                border: 1px solid #334155;
-                background: rgba(15, 23, 42, 0.95);
-                padding: 10px 16px;
-                font-size: 14px;
-                font-weight: 600;
-                color: #f8fbff;
+                min-height: 44px; border-radius: 18px;
+                border: 1px solid #334155; background: rgba(15,23,42,0.95);
+                padding: 10px 16px; font-size: 14px; font-weight: 600; color: #f8fbff;
             }
-            QComboBox#RecipeCombo::drop-down {
-                border: none;
-                width: 40px;
-            }
+            QComboBox#RecipeCombo::drop-down { border: none; width: 40px; }
             QPushButton {
-                border: none;
-                border-radius: 20px;
-                padding: 10px 14px;
-                font-size: 14px;
-                font-weight: 700;
+                border: none; border-radius: 20px;
+                padding: 10px 14px; font-size: 14px; font-weight: 700;
             }
             QPushButton#SecondaryButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1e293b, stop:1 #334155);
-                color: #e2e8f0;
-                border: 1px solid #475569;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #1e293b,stop:1 #334155);
+                color: #e2e8f0; border: 1px solid #475569;
             }
             QPushButton#StartButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #10b981, stop:1 #059669);
-                color: white;
-                border: 1px solid #34d399;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #10b981,stop:1 #059669);
+                color: white; border: 1px solid #34d399;
             }
             QPushButton#PauseButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f59e0b, stop:1 #d97706);
-                color: white;
-                border: 1px solid #fbbf24;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #facc15,stop:1 #eab308);
+                color: #1f2937; border: 1px solid #fde047;
             }
             QPushButton#StopButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #dc2626, stop:1 #b91c1c);
-                color: white;
-                border: 1px solid #f87171;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #dc2626,stop:1 #b91c1c);
+                color: white; border: 1px solid #f87171;
             }
             QPushButton#ResetButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2563eb, stop:1 #1d4ed8);
-                color: white;
-                border: 1px solid #60a5fa;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #1f2937,stop:1 #030712);
+                color: white; border: 1px solid #475569;
             }
             QPushButton#PurgeButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7c3aed, stop:1 #6d28d9);
-                color: white;
-                border: 1px solid #a78bfa;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #2563eb,stop:1 #1d4ed8);
+                color: white; border: 1px solid #60a5fa;
             }
-                        QPushButton:hover {
-                opacity: 0.95;
+            QPushButton#TubeChangeButton {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #7c3aed,stop:1 #6d28d9);
+                color: white; border: 1px solid #a78bfa;
             }
-            QPushButton:pressed {
-                padding-top: 16px;
-                padding-bottom: 12px;
+            QPushButton:hover   { opacity: 0.9; }
+            QPushButton:pressed { padding-top: 14px; padding-bottom: 10px; }
+
+            /* ---- Dialog styling (prevents invisible text on white background) ---- */
+            QMessageBox { background-color: #0f172a; }
+            QMessageBox QLabel {
+                color: #f8fbff; font-size: 15px; font-weight: 600;
+                padding: 10px 4px; min-width: 360px;
             }
-            """
-        )
+            QMessageBox QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #1e293b,stop:1 #334155);
+                color: #f8fbff; border: 1px solid #475569; border-radius: 10px;
+                padding: 8px 24px; min-width: 90px;
+                font-size: 14px; font-weight: 700;
+            }
+            QMessageBox QPushButton:hover {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #334155,stop:1 #475569);
+            }
+        """)
+
+    # ------------------------------------------------------------------
+    # Recipe list management
+    # ------------------------------------------------------------------
 
     def refresh_recipes(self):
         self.recipe_combo.clear()
-        recipe_files = sorted(self.recipe_dir.glob("*.py"))
-        for file in recipe_files:
-            self.recipe_combo.addItem(file.stem, str(file))
+        for f in sorted(self.recipe_dir.glob("*.py")):
+            self.recipe_combo.addItem(f.stem, str(f))
         if self.recipe_combo.count() == 0:
-            self.recipe_combo.addItem(DEFAULT_RECIPE, str(self.recipe_dir / f"{DEFAULT_RECIPE}.py"))
+            self.recipe_combo.addItem(
+                DEFAULT_RECIPE, str(self.recipe_dir / f"{DEFAULT_RECIPE}.py")
+            )
 
     def update_loaded_program_display(self):
-        loaded_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
-        self.loaded_program_label.setText(loaded_name)
+        name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
+        self.loaded_program_label.setText(name)
 
     def on_recipe_selected(self, _index: int):
+        if self.robot._cycle_active() or self.robot._reset_active() or self.robot.state.robot_resetting:
+            self.update_loaded_program_display()
+            return
         recipe_path_raw = self.recipe_combo.currentData()
         if not recipe_path_raw:
             self.update_loaded_program_display()
-            self.update_status()
             return
-
-        if self.robot._cycle_active() or self.robot._reset_active() or self.robot.state.robot_resetting:
-            self.update_loaded_program_display()
-            self.update_status()
-            return
-
-        recipe_path = Path(recipe_path_raw)
-        recipe_name = recipe_path.stem
-
         try:
-            self.robot.load_recipe(recipe_name, recipe_path)
+            self.robot.load_recipe(Path(recipe_path_raw).stem, Path(recipe_path_raw))
         except Exception as exc:
             QMessageBox.critical(self, "Load Failed", str(exc))
-
         self.update_loaded_program_display()
-        self.update_status()
 
     def set_live_commentary(self, text: str):
         self.live_commentary.setText(text)
 
+    # ------------------------------------------------------------------
+    # Main poll tick
+    # ------------------------------------------------------------------
+
     def update_status(self):
-        board_present = self.robot.read_board_present()
-        _cartridge_empty = self.robot.read_cartridge_empty()
-        manual_mode = self.robot.read_manual_mode()
+        # --- Single bulk GPIO read for this tick ---
+        self.robot.refresh_gpio_cache()
+
+        # --- Read all values (no extra SDK calls) ---
+        board_present       = self.robot.read_board_present()
         light_curtain_broken = self.robot.read_light_curtain()
-        physical_start = self.robot.read_physical_start()
-        pause_button = self.robot.read_pause_button()
-        stop_button = self.robot.read_stop_button()
-        state_code = self.robot.read_robot_state_code()
-        mode_code = self.robot.read_robot_mode_code()
-        warning_code = self.robot.read_warning_code()
-        error_code = self.robot.read_error_code()
+        physical_start      = self.robot.read_physical_start()
+        pause_button        = self.robot.read_pause_button()
+        stop_button         = self.robot.read_stop_button()
+        reset_button        = self.robot.read_reset_button()
+        tube_change_button  = self.robot.read_tube_change_button()
+        manual_mode         = self.robot.read_manual_mode()   # reads from cb_snapshot
+        state_code          = self.robot.read_robot_state_code()
+        mode_code           = self.robot.read_robot_mode_code()
+        warning_code        = self.robot.read_warning_code()
+        error_code          = self.robot.read_error_code()
 
+        # Derived flags
         emergency_stop_active = error_code in {1, 2, 3}
-        manual_mode_active = manual_mode or mode_code == 2
-        if self.robot.arm is None:
-            robot_enabled = False
-        else:
-            robot_enabled = error_code == 0 and state_code is not None and state_code < 4
-        robot_moving = bool(self.robot.state.robot_running or state_code == 1)
+        manual_mode_active    = manual_mode or mode_code == 2
+        robot_enabled = (
+            False if self.robot.arm is None
+            else (error_code == 0 and state_code is not None and state_code < 4)
+        )
+        robot_moving   = bool(self.robot.state.robot_running or state_code == 1)
         motion_stopped = bool(state_code in {3, 4} or (not robot_moving and robot_enabled))
-        dispenser_on = self.robot.is_dispenser_on()
-        loaded_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
-        loaded_program_count = self.robot.get_program_cycle_count(loaded_name)
-        loaded_program_last_cycle = self.robot.get_program_last_cycle_seconds(loaded_name)
+        dispenser_on   = self.robot.is_dispenser_on()
+        loaded_name    = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
 
-        # ---- Hardware button edge handling (rising edge: False -> True) ----
-        # Light curtain: auto-pause running cycle when beam breaks.
+        # ============================================================
+        # Hardware button / sensor edge handling  (rising edge = True)
+        # ============================================================
+
+        # Manual mode engaged — abort any running cycle immediately
+        if manual_mode_active and not self.manual_mode_latch:
+            if self.robot.state.robot_running or self.robot.state.robot_paused:
+                self.robot.abort_for_manual_mode()
+        self.manual_mode_latch = manual_mode_active
+
+        # Light curtain broken — auto-pause
         if light_curtain_broken and not self.curtain_latch:
             if self.robot.state.robot_running and not self.robot.state.robot_paused:
                 try:
@@ -1134,44 +1250,54 @@ class MainWindow(QMainWindow):
                     self.robot.state.light_curtain_paused = True
                 except Exception as exc:
                     print(f"Light curtain auto-pause failed: {exc}")
-        if not light_curtain_broken:
-            # Beam restored — operator may now resume by pressing Start.
-            pass
         self.curtain_latch = light_curtain_broken
 
-        # CI5 pause button.
+        # CI5 — Pause
         if pause_button and not self.pause_latch:
             if self.robot.state.robot_running and not self.robot.state.robot_paused:
                 self.pause_cycle()
         self.pause_latch = pause_button
 
-        # CI6 stop button.
+        # CI6 — Stop
         if stop_button and not self.stop_latch:
             if self.robot.state.robot_running or self.robot.state.robot_paused:
                 self.stop_cycle()
         self.stop_latch = stop_button
 
-        # CI4 start / resume button — gated by light curtain.
+        # CI7 — Reset to home
+        if reset_button and not self.reset_latch:
+            if not self.robot.state.robot_resetting:
+                self.reset_system()
+        self.reset_latch = reset_button
+
+        # CI2 — Tube change
+        if tube_change_button and not self.tube_change_latch:
+            self.run_tube_change()
+        self.tube_change_latch = tube_change_button
+
+        # CI4 — Start / Resume  (gated by light curtain)
         if physical_start and not self.start_latch:
             self.start_latch = True
             if light_curtain_broken:
                 QMessageBox.warning(
-                    self,
-                    "Cannot Start",
-                    "Light curtain is broken. Clear the area before starting.",
+                    self, "Cannot Start",
+                    "Light curtain is broken.\nClear the area before starting.",
                 )
             elif not self.robot.state.robot_running and not self.robot.state.robot_resetting:
                 self.start_cycle()
         elif not physical_start:
             self.start_latch = False
 
-        # ---- Status card updates ----
+        # ============================================================
+        # Status card updates
+        # ============================================================
         self.program_card.set_status(loaded_name, True)
-        self.board_card.set_status("DETECTED" if board_present else "NOT DETECTED", board_present)
+        self.board_card.set_status(
+            "DETECTED" if board_present else "NOT DETECTED", board_present)
         self.light_curtain_card.set_status(
             "BROKEN" if light_curtain_broken else "CLEAR",
             not light_curtain_broken,
-            "Robot will pause when broken",
+            "Robot pauses when broken",
         )
         self.manual_card.set_status(
             "ENABLED" if manual_mode_active else "DISABLED",
@@ -1188,53 +1314,73 @@ class MainWindow(QMainWindow):
             error_code == 0,
             f"error_code={error_code}",
         )
-        self.motion_card.set_status("STOPPED" if motion_stopped else "MOVING", not motion_stopped)
-        self.dispenser_card.set_status("ON" if dispenser_on else "OFF", dispenser_on)
+        self.motion_card.set_status(
+            "STOPPED" if motion_stopped else "MOVING", not motion_stopped)
+        self.dispenser_card.set_status(
+            "ON" if dispenser_on else "OFF", dispenser_on)
 
-        # ---- Hero / run state ----
-        state_subtitle = (
+        # ============================================================
+        # Hero / run state + live commentary
+        # ============================================================
+        state_sub = (
             f"State {state_code if state_code is not None else '--'} / "
             f"Mode {mode_code if mode_code is not None else '--'}"
         )
+
         if emergency_stop_active:
-            self.run_card.set_status("E-STOP", False, state_subtitle)
+            self.run_card.set_status("E-STOP", False, state_sub)
             self.hero_state.setText("ESTOP ACTIVE")
-            self.set_live_commentary("Emergency stop is active. Release the E-stop on the cabinet, then press Reset.")
+            self.set_live_commentary(
+                "Emergency stop is active. Release the E-stop on the cabinet, then press Reset.")
+
         elif self.robot.last_reset_error or error_code:
-            self.run_card.set_status("FAULT", False, state_subtitle)
+            self.run_card.set_status("FAULT", False, state_sub)
             self.hero_state.setText("SYSTEM FAULT")
-            self.set_live_commentary(self.robot.last_reset_error or f"Robot error code {error_code}. Press Reset to recover.")
+            self.set_live_commentary(
+                self.robot.last_reset_error
+                or f"Robot error code {error_code}. Press Reset to recover.")
+
         elif manual_mode_active:
-            self.run_card.set_status("MANUAL", True, state_subtitle)
+            self.run_card.set_status("MANUAL", True, state_sub)
             self.hero_state.setText("MANUAL MODE")
-            self.set_live_commentary("Manual mode active: the arm can be guided by hand. Switch to auto to run programs.")
+            self.set_live_commentary(
+                "Manual mode: arm can be guided by hand. Switch to auto to run programs.")
+
         elif self.robot.state.robot_resetting:
-            self.run_card.set_status("RESETTING", False, state_subtitle)
+            self.run_card.set_status("RESETTING", False, state_sub)
             self.hero_state.setText("SYSTEM RESETTING")
             self.set_live_commentary("Moving to home position")
+
         elif self.robot.state.robot_running:
-            self.run_card.set_status("RUNNING", True, state_subtitle)
+            self.run_card.set_status("RUNNING", True, state_sub)
             self.hero_state.setText("SYSTEM RUNNING")
             self.set_live_commentary(f"Running program {loaded_name}")
+
         elif self.robot.state.robot_paused:
-            self.run_card.set_status("PAUSED", False, state_subtitle)
+            self.run_card.set_status("PAUSED", False, state_sub)
             self.hero_state.setText("SYSTEM PAUSED")
             if self.robot.state.light_curtain_paused:
                 if light_curtain_broken:
-                    self.set_live_commentary("Paused: light curtain is broken. Clear the area, then press Start to resume.")
+                    self.set_live_commentary(
+                        "Paused: light curtain is broken. Clear the area, then press Start to resume.")
                 else:
-                    self.set_live_commentary("Paused by light curtain. Press Start to resume.")
+                    self.set_live_commentary(
+                        "Paused by light curtain. Beam is clear — press Start to resume.")
             else:
                 self.set_live_commentary("Paused by operator. Press Start to resume.")
+
         elif self.robot.state.robot_stopped:
-            self.run_card.set_status("STOPPED", False, state_subtitle)
+            self.run_card.set_status("STOPPED", False, state_sub)
             self.hero_state.setText("SYSTEM STOPPED")
-            self.set_live_commentary("Stopped by operator. Press Start to run the program from the beginning.")
+            self.set_live_commentary(
+                "Stopped. Press Start to run the program from the beginning.")
+
         else:
-            self.run_card.set_status("IDLE", robot_enabled, state_subtitle)
+            self.run_card.set_status("IDLE", robot_enabled, state_sub)
             self.hero_state.setText("SYSTEM IDLE")
             if light_curtain_broken:
-                self.set_live_commentary("Light curtain is broken. Clear the area before starting.")
+                self.set_live_commentary(
+                    "Light curtain is broken. Clear the area before starting.")
             elif warning_code:
                 self.set_live_commentary(f"Robot warning code {warning_code}")
             elif not board_present:
@@ -1242,15 +1388,20 @@ class MainWindow(QMainWindow):
             else:
                 self.set_live_commentary(f"Ready to run program {loaded_name}. Press Start.")
 
-        self.cycle_count_card.set_value(str(loaded_program_count))
-        self.last_cycle_card.set_value(self.format_cycle_time(loaded_program_last_cycle))
+        self.cycle_count_card.set_value(
+            str(self.robot.get_program_cycle_count(loaded_name)))
+        self.last_cycle_card.set_value(
+            self.format_cycle_time(self.robot.get_program_last_cycle_seconds(loaded_name)))
+
+    # ------------------------------------------------------------------
+    # Operator button handlers
+    # ------------------------------------------------------------------
 
     def start_cycle(self):
         if self.robot.state.light_curtain_broken:
             QMessageBox.warning(
-                self,
-                "Cannot Start",
-                "Light curtain is broken. Clear the area before starting.",
+                self, "Cannot Start",
+                "Light curtain is broken.\nClear the area before starting.",
             )
             return
 
@@ -1258,22 +1409,22 @@ class MainWindow(QMainWindow):
             try:
                 self.robot.start_cycle()
                 self.robot.state.light_curtain_paused = False
-                active_name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
-                self.set_live_commentary(f"Resumed program {active_name}")
+                name = self.robot.current_recipe or self.recipe_combo.currentText() or DEFAULT_RECIPE
+                self.set_live_commentary(f"Resumed program {name}")
             except Exception as exc:
                 QMessageBox.critical(self, "Resume Failed", str(exc))
             return
 
         recipe_path_raw = self.recipe_combo.currentData()
         if not recipe_path_raw:
-            QMessageBox.warning(self, "No Program", "No dispense program was found in the recipes folder.")
+            QMessageBox.warning(
+                self, "No Program",
+                "No dispense program found. Add a recipe file to the recipes folder.")
             return
 
-        recipe_path = Path(recipe_path_raw)
-        recipe_name = recipe_path.stem
-
         try:
-            self.robot.load_recipe(recipe_name, recipe_path)
+            recipe_path = Path(recipe_path_raw)
+            self.robot.load_recipe(recipe_path.stem, recipe_path)
             self.update_loaded_program_display()
             self.robot.start_cycle()
             self.robot.state.light_curtain_paused = False
@@ -1287,6 +1438,14 @@ class MainWindow(QMainWindow):
             self.set_live_commentary("Running epoxy purge")
         except Exception as exc:
             QMessageBox.critical(self, "Purge Failed", str(exc))
+
+    def run_tube_change(self):
+        try:
+            self.robot.run_tube_change()
+            self.update_loaded_program_display()
+            self.set_live_commentary("Moving to tube change position")
+        except Exception as exc:
+            QMessageBox.critical(self, "Tube Change Failed", str(exc))
 
     def pause_cycle(self):
         try:
@@ -1305,11 +1464,22 @@ class MainWindow(QMainWindow):
     def reset_system(self):
         try:
             self.robot.reset_to_initial_position()
-            self.set_live_commentary("Re-enabling robot")
+            self.set_live_commentary("Resetting — moving to home position")
         except Exception as exc:
             QMessageBox.critical(self, "Reset Failed", str(exc))
 
-    
+    # ------------------------------------------------------------------
+    # Clean shutdown
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        self.poll_timer.stop()
+        self.robot.disconnect_robot()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
