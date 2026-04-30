@@ -98,18 +98,13 @@ class RobotMain(object):
         try:
             self._tcp_speed = 800
             self._tcp_acc = 15000
-            code = self._arm.set_position(*[207.7, 7.3, 106.3, -179.9, 0.0, 84.8], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+            code = self._arm.set_position(*[238.5, 145.5, 99.8, -176.9, 0.0, 84.8], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
             if not self._check_code(code, 'set_position'):
                 return
-            code = self._arm.set_position(z=100, radius=-1, speed=self._tcp_speed, mvacc=self._tcp_acc, relative=True, wait=True)
             code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
-            code = self._arm.set_position(*[593.1, 201.8, 106.3, -179.9, 0.0, 84.8], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
-            if not self._check_code(code, 'set_position'):
-                return
-            
             if not self._check_code(code, 'set_cgpio_digital'):
                 return
-            for i in range(int(5/ 0.1)):
+            for i in range(int(10/ 0.1)):
                 time.sleep(0.1)
                 if not self.is_alive:
                     return
@@ -119,7 +114,9 @@ class RobotMain(object):
             code = self._arm.set_position(z=100, radius=-1, speed=self._tcp_speed, mvacc=self._tcp_acc, relative=True, wait=True)
             if not self._check_code(code, 'set_position'):
                 return
-            self._arm.move_gohome()
+            code = self._arm.set_position(*[238.5, 145.5, 99.8, -176.9, 0.0, 84.8], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+            if not self._check_code(code, 'set_position'):
+                return
         except Exception as e:
             self.pprint('MainException: {}'.format(e))
         finally:
@@ -130,7 +127,7 @@ class RobotMain(object):
 
 if __name__ == '__main__':
     RobotMain.pprint('xArm-Python-SDK Version:{}'.format(version.__version__))
-    arm = XArmAPI('192.168.1.196', baud_checkset=False)
+    arm = XArmAPI('10.40.17.196', baud_checkset=False)
     time.sleep(0.5)
     robot_main = RobotMain(arm)
     robot_main.run()

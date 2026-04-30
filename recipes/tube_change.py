@@ -96,19 +96,12 @@ class RobotMain(object):
     # Robot Main Run
     def run(self):
         try:
-            self._tcp_speed = 500
-            self._tcp_acc = 20000
-            code = self._arm.set_cgpio_digital(7, 0, delay_sec=0, sync=True)
-            if not self._check_code(code, 'set_cgpio_digital'):
-                return
-            code = self._arm.set_position(z=200, radius=-1, speed=self._tcp_speed, mvacc=self._tcp_acc, relative=True, wait=True)
+            self._tcp_speed = 1000
+            self._tcp_acc = 15000
+            code = self._arm.set_position(z=100, radius=-1, speed=self._tcp_speed, mvacc=self._tcp_acc, relative=True, wait=True)
             if not self._check_code(code, 'set_position'):
                 return
-            code = self._arm.set_servo_angle(angle=[0.0, 0.0, -90.0, 0.0, 0.0, 0.0], speed=self._angle_speed, mvacc=self._angle_acc, wait=True, radius=0.0)
-            if not self._check_code(code, 'set_servo_angle'):
-                return
-            self._arm.move_gohome()
-            code = self._arm.set_position(*[238.5, 145.5, 99.8, -176.9, 0.3, 88.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+            code = self._arm.set_position(*[732.2, -600.1, 396.6, 90.7, 1.4, 0.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
             if not self._check_code(code, 'set_position'):
                 return
         except Exception as e:
