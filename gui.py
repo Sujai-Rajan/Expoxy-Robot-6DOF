@@ -186,9 +186,6 @@ class RobotController:
         self._cb_lock     = threading.Lock()
         self._cb_snapshot: dict = {}  # keys: 'state', 'mode', 'error_code', 'warn_code', 'connected'
 
-        # GPIO bulk-read cache (refreshed once per poll tick)
-        self._gpio_cache: dict = {}   # {channel(0-15): bool}
-
         self.connect_robot()
 
     # ------------------------------------------------------------------
@@ -248,52 +245,43 @@ class RobotController:
             self._cb_snapshot["warn_code"]  = data.get("warn_code",  0)
 
     # ------------------------------------------------------------------
-    # Bulk GPIO read  (one SDK call refreshes all 16 channels)
+    # GPIO reads — individual get_cgpio_digital() calls (proven reliable)
     # ------------------------------------------------------------------
-
-    def refresh_gpio_cache(self) -> None:
-        """
-        Populate _gpio_cache with a single get_cgpio_state() call.
-        states[2] is a 16-bit integer: bit i = state of CGPIO channel i.
-        CI0-CI7 = channels 0-7, DI0-DI7 = channels 8-15.
-        Call this once per poll tick before reading any CI/DI.
-        """
-        if self.arm is None:
-            self._gpio_cache = {}
-            return
-        try:
-            result = self.arm.get_cgpio_state()
-            # SDK returns (code, states) or just states depending on wrapper version
-            if isinstance(result, (list, tuple)) and len(result) >= 2:
-                code, states = result[0], result[1]
-            else:
-                self._gpio_cache = {}
-                return
-            if code != 0 or not isinstance(states, (list, tuple)) or len(states) < 3:
-                self._gpio_cache = {}
-                return
-            inp_word = int(states[2])
-            self._gpio_cache = {ch: bool((inp_word >> ch) & 1) for ch in range(16)}
-        except Exception as exc:
-            print(f"get_cgpio_state failed: {exc}")
-            self._gpio_cache = {}
 
     @staticmethod
     def ci_channel(index: int) -> int:
-        return index           # CI0-CI7 = channels 0-7
+        return index           # CI0-CI7 = CGPIO channels 0-7
 
     @staticmethod
     def di_channel(index: int) -> int:
-        return 8 + index       # DI0-DI7 = channels 8-15
+        return 8 + index       # DI0-DI7 = CGPIO channels 8-15
 
-    def _read_cached(self, channel: int) -> bool:
-        return self._gpio_cache.get(channel, False)
+    def _read_cgpio_channel(self, channel: int) -> bool:
+        """Read a single CGPIO channel by number using get_cgpio_digital()."""
+        if self.arm is None:
+            # Offline fallback: reflect known sensor state
+            if channel == self.di_channel(BOARD_PRESENT_DI):
+                return self.state.board_present
+            if channel == self.di_channel(CARTRIDGE_EMPTY_DI):
+                return self.state.cartridge_empty
+            return False
+        try:
+            result = self.arm.get_cgpio_digital(channel)
+            if isinstance(result, (list, tuple)) and len(result) > 1:
+                return bool(result[1])
+        except Exception as exc:
+            print(f"get_cgpio_digital({channel}) failed: {exc}")
+        return False
 
     def read_ci(self, index: int) -> bool:
-        return self._read_cached(self.ci_channel(index))
+        return self._read_cgpio_channel(self.ci_channel(index))
 
     def read_di(self, index: int) -> bool:
-        return self._read_cached(self.di_channel(index))
+        return self._read_cgpio_channel(self.di_channel(index))
+
+    # No-op kept so any call sites that invoke refresh are harmless
+    def refresh_gpio_cache(self) -> None:
+        pass
 
     # ------------------------------------------------------------------
     # Named sensor reads (all use cache after refresh_gpio_cache())
