@@ -1029,7 +1029,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1054,7 +1054,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1082,7 +1082,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1107,7 +1107,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1129,7 +1129,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1157,7 +1157,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1182,7 +1182,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1210,7 +1210,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
@@ -1235,7 +1235,7 @@ class RobotMain(object):
                         code = self._arm.set_cgpio_digital(7, 1, delay_sec=0, sync=True)
                         if not self._check_code(code, 'set_cgpio_digital'):
                             return
-                        for i in range(int(8/ 0.1)):
+                        for i in range(int(5/ 0.1)):
                             time.sleep(0.1)
                             if not self.is_alive:
                                 return
