@@ -22,7 +22,7 @@ class RobotMain(object):
         self._tcp_acc = 2000
         self._angle_speed = 20
         self._angle_acc = 500
-        self._vars = {'flag_i': 0, 'flag_e': 0, 'flag_d': 0, 'flag_m': 0}
+        self._vars = {'flag_d': 0, 'flag_i': 0, 'flag_m': 0, 'flag_e': 0}
         self._funcs = {}
         self._robot_init()
 
@@ -152,7 +152,7 @@ class RobotMain(object):
                         code = self._arm.set_position(*[409.9, 153.3, 56.0, -138.9, 33.9, 87.9], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[409.9, 105.1, 56.0, -138.9, 33.9, 87.9], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[409.9, 106.5, 56.0, -138.9, 33.9, 87.9], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[414.9, 103.9, 46.2, -138.9, 33.9, 87.9], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
@@ -222,10 +222,10 @@ class RobotMain(object):
                         code = self._arm.set_position(*[540.8, 21.6, 57.8, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[500.5, 21.6, 56.1, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[499.9, 21.6, 56.1, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[499.1, -11.6, 53.7, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[500.1, -11.6, 53.7, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[495.5, -4.9, 45.1, -174.3, 49.1, 73.5], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
@@ -327,7 +327,7 @@ class RobotMain(object):
                         code = self._arm.set_position(*[539.2, 18.0, 58.5, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[500.9, -13.4, 58.5, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[500.9, -12.3, 58.5, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[505.0, -18.7, 48.4, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
@@ -388,7 +388,7 @@ class RobotMain(object):
                     if True:
                         self._tcp_speed = 500
                         self._tcp_acc = 5000
-                        code = self._arm.set_position(*[558.0, -16.1, 57.4, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[558.0, -14.6, 57.4, -141.0, 34.1, 70.3], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[554.3, 20.2, 57.5, 174.0, 52.3, 65.0], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
@@ -400,7 +400,7 @@ class RobotMain(object):
                         code = self._arm.set_position(*[620.3, -128.0, 57.5, 174.0, 52.3, 65.0], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[559.3, -128.8, 54.9, 174.0, 52.3, 65.0], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[559.7, -128.8, 54.9, 174.0, 52.3, 65.0], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[555.6, -128.7, 47.5, 174.0, 52.3, 65.0], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
@@ -543,10 +543,7 @@ class RobotMain(object):
                         code = self._arm.set_position(*[495.5, -195.0, 57.8, -127.8, 1.6, 58.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
-                        code = self._arm.set_position(*[498.8, -194.6, 72.4, -127.8, 1.6, 58.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
-                        if not self._check_code(code, 'set_position'):
-                            return
-                        code = self._arm.set_position(*[517.8, -135.0, 60.3, -127.8, 1.6, 58.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
+                        code = self._arm.set_position(*[507.3, -194.6, 72.4, -127.8, 1.6, 58.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
                         if not self._check_code(code, 'set_position'):
                             return
                         code = self._arm.set_position(*[503.2, -135.0, 60.3, -127.8, 1.6, 58.1], speed=self._tcp_speed, mvacc=self._tcp_acc, radius=0.0, wait=True)
